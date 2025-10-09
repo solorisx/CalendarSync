@@ -1,0 +1,10 @@
+{
+  "google_calendar_id": "123456789",
+  "icloud": {
+    "url": "https://caldav.icloud.com/",
+    "username": "your-apple-id@icloud.com",
+    "password": "app-specific-password",
+    "calendar_name": null
+  },
+  "notify_url": "https://ntfy.sh/your-channel"
+}
