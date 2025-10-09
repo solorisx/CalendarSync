@@ -25,10 +25,10 @@ Bidirectional calendar synchronization between Google Calendar and iCloud Calend
 
 ```bash
 # Clone/download the repository
-cd CalendarSync2
+cd CalendarSync
 
 # Run setup script
-./setup.sh
+./scripts/setup.sh
 ```
 
 ### 2. Configure Google Calendar
@@ -106,7 +106,12 @@ docker-compose logs -f
 ### View Logs
 
 ```bash
+# Direct Docker command
 docker-compose logs -f
+
+# Or use the helper script
+./scripts/logs.sh          # Local (default)
+./scripts/logs.sh remote   # Remote deployment
 ```
 
 ### Manual Sync
@@ -114,7 +119,12 @@ docker-compose logs -f
 Trigger an immediate sync without waiting for the interval:
 
 ```bash
-./sync_now.sh
+# Direct Docker command
+docker-compose exec calendar-sync python sync_once.py
+
+# Or use the helper script
+./scripts/sync-now.sh          # Local (default)
+./scripts/sync-now.sh remote   # Remote deployment
 ```
 
 ### Restart Service
@@ -246,8 +256,76 @@ docker-compose restart
 
 MIT License - feel free to use and modify as needed.
 
+## Deployment to Raspberry Pi
+
+Deploy and manage CalendarSync on a remote Raspberry Pi:
+
+### Initial Deployment
+
+```bash
+# Default (assumes raspberrypi hostname, pi user, ~/CalendarSync path)
+./scripts/deploy.sh
+
+# Custom settings
+REMOTE_HOST=192.168.1.100 REMOTE_USER=myuser ./scripts/deploy.sh
+```
+
+The deploy script will:
+- Test SSH connection
+- Sync all project files (excluding data directory)
+- Stop, rebuild, and restart containers
+- Show recent logs
+
+**First-time deployment:** The script will detect if this is the first deployment and guide you through setting up credentials.
+
+### Remote Management
+
+```bash
+# View logs from remote
+./scripts/logs.sh remote
+
+# Trigger immediate sync on remote
+./scripts/sync-now.sh remote
+
+# SSH into the Pi
+ssh pi@raspberrypi
+cd ~/CalendarSync
+```
+
+### Environment Variables
+
+Set these to customize remote connection (or use defaults):
+
+```bash
+export REMOTE_HOST=raspberrypi      # Default: raspberrypi
+export REMOTE_USER=pi                # Default: pi
+export REMOTE_PATH=~/CalendarSync    # Default: ~/CalendarSync
+```
+
+## Project Structure
+
+```
+CalendarSync/
+├── scripts/              # Utility scripts
+│   ├── setup.sh         # Initial setup
+│   ├── deploy.sh        # Deploy to Raspberry Pi
+│   ├── logs.sh          # View logs (local/remote)
+│   └── sync-now.sh      # Trigger sync (local/remote)
+├── data/                # Persistent data (gitignored)
+│   ├── config.json      # Configuration
+│   ├── credentials.json # Google OAuth credentials
+│   ├── token.pickle     # Google OAuth tokens
+│   └── sync_state.json  # Sync state tracking
+├── sync_calendars.py    # Main sync service
+├── sync_once.py         # One-time sync script
+├── initial_auth.py      # OAuth setup helper
+├── docker-compose.yml   # Docker configuration
+├── Dockerfile           # Container definition
+└── requirements.txt     # Python dependencies
+```
+
 ## Support
 
 For issues and questions:
 - Check the troubleshooting section above
-- Check Docker logs: `docker-compose logs -f`
+- Check Docker logs: `./scripts/logs.sh` or `docker-compose logs -f`
