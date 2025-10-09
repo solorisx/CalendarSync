@@ -1,4 +1,4 @@
-# CalendarSync2
+# CalendarSync
 
 Bidirectional calendar synchronization between Google Calendar and iCloud Calendar. Runs as a Docker container with automatic sync intervals and optional notifications.
 
@@ -235,47 +235,6 @@ echo '{"last_sync": null, "synced_events": {}, "last_error": null}' > data/sync_
 docker-compose restart
 ```
 
-## File Structure
-
-```
-CalendarSync2/
-├── sync_calendars.py      # Main sync application
-├── sync_once.py           # Single sync execution (no loop)
-├── initial_auth.py        # OAuth authentication helper
-├── Dockerfile             # Container definition
-├── docker-compose.yml     # Service configuration
-├── requirements.txt       # Python dependencies
-├── setup.sh              # Initial setup script
-├── sync_now.sh           # Manual sync trigger
-├── data/                 # Persistent data (mounted volume)
-│   ├── config.json       # Your credentials & settings
-│   ├── credentials.json  # Google OAuth credentials
-│   ├── token.pickle      # Google OAuth token (auto-generated)
-│   └── sync_state.json   # Sync state (auto-generated)
-└── README.md            # This file
-```
-
-## Advanced Configuration
-
-### Sync Only One Direction
-
-Edit `sync_calendars.py` in the `run_sync()` method and comment out one direction:
-
-```python
-google_result = self.sync_google_to_icloud(google_service, icloud_calendar)
-# icloud_result = self.sync_icloud_to_google(google_service, icloud_calendar)  # Disabled
-```
-
-Then rebuild: `docker-compose build && docker-compose up -d`
-
-### Disable Deletion Propagation
-
-Comment out the deletion detection sections in both sync methods, then rebuild.
-
-### Change Time Window
-
-Modify `timedelta(days=90)` in both `sync_google_to_icloud()` and `sync_icloud_to_google()` methods.
-
 ## Security Notes
 
 - **OAuth tokens** are stored in `data/token.pickle` - keep this secure
@@ -291,5 +250,4 @@ MIT License - feel free to use and modify as needed.
 
 For issues and questions:
 - Check the troubleshooting section above
-- Review `CLAUDE.md` for technical details
 - Check Docker logs: `docker-compose logs -f`
