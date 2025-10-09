@@ -191,10 +191,23 @@ class CalendarSync:
                 print(f"  ✗ Error: {e}")
 
         # Detect deletions: events that were synced from Google but no longer exist
+        # Only check events that fall within the current time window
         events_to_delete = []
         for event_id, event_info in self.state['synced_events'].items():
-            if event_info.get('source') == 'google' and event_id not in current_google_ids:
-                events_to_delete.append(event_id)
+            if event_info.get('source') == 'google':
+                # Check if event is within the time window
+                event_start = event_info.get('start')
+                if event_start:
+                    try:
+                        # Parse the event start time
+                        event_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                        # Only consider for deletion if within our query window
+                        if time_min <= event_dt.isoformat() <= time_max:
+                            if event_id not in current_google_ids:
+                                events_to_delete.append(event_id)
+                    except:
+                        # If we can't parse the date, skip this event
+                        pass
 
         # Delete events from iCloud that were deleted from Google
         for event_id in events_to_delete:
@@ -319,10 +332,23 @@ class CalendarSync:
                         print(f"  ✗ Error: {e}")
 
         # Detect deletions: events that were synced from iCloud but no longer exist
+        # Only check events that fall within the current time window
         events_to_delete = []
         for event_id, event_info in self.state['synced_events'].items():
-            if event_info.get('source') == 'icloud' and event_id not in current_icloud_ids:
-                events_to_delete.append(event_id)
+            if event_info.get('source') == 'icloud':
+                # Check if event is within the time window
+                event_start = event_info.get('start')
+                if event_start:
+                    try:
+                        # Parse the event start time
+                        event_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                        # Only consider for deletion if within our query window
+                        if start <= event_dt <= end:
+                            if event_id not in current_icloud_ids:
+                                events_to_delete.append(event_id)
+                    except:
+                        # If we can't parse the date, skip this event
+                        pass
 
         # Delete events from Google that were deleted from iCloud
         for event_id in events_to_delete:
