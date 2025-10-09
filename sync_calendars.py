@@ -152,6 +152,7 @@ class CalendarSync:
         events = events_result.get('items', [])
         synced_count = 0
         deleted_count = 0
+        error_count = 0
         added_events = []
         deleted_events = []
 
@@ -189,12 +190,15 @@ class CalendarSync:
 
         # Add new events
         for event in events:
-            # Use iCalUID if available (for events synced from iCloud), otherwise use event ID
-            # This prevents syncing iCloud events back to iCloud
-            event_uid = event.get('iCalUID', event['id'])
-            event_id = event['id']
 
-            if event_uid in self.state['synced_events'] or event_id in self.state['synced_events']:
+            if event.get('iCalUID'):
+                # source is iCloud
+                continue
+
+            event_uid = event['id']
+
+            if event_uid in self.state['synced_events']:
+                # already synced
                 continue
 
             # Check if event already exists in iCloud (by UID)
@@ -232,19 +236,18 @@ class CalendarSync:
 
             ical_event.add('dtstart', start_dt)
             ical_event.add('dtend', end_dt)
-            ical_event.add('uid', event_id)
+            ical_event.add('uid', event_uid)
 
             cal.add_component(ical_event)
 
             try:
                 event_start = event['start'].get('dateTime', event['start'].get('date'))
                 icloud_calendar.save_event(cal.to_ical())
-                self.state['synced_events'][event_id] = {
+                self.state['synced_events'][event_uid] = {
                     'title': event.get('summary'),
                     'synced_at': datetime.now().isoformat(),
                     'source': 'google',
                     'start': event_start,
-                    'google_id': event_id  # Store Google ID for reference
                 }
                 synced_count += 1
                 added_events.append({
@@ -255,15 +258,15 @@ class CalendarSync:
             except Exception as e:
                 print(f"  ✗ Error syncing '{event.get('summary')}': {e}")
                 # Still mark as synced to avoid retrying on every sync
-                self.state['synced_events'][event_id] = {
+                self.state['synced_events'][event_uid] = {
                     'title': event.get('summary'),
                     'synced_at': datetime.now().isoformat(),
                     'source': 'google',
                     'start': event_start,
                     'sync_failed': True,
                     'error': str(e),
-                    'google_id': event_id
                 }
+                error_count += 1
 
         # Detect deletions: events that were synced from Google but no longer exist
         # Only check events that fall within the current time window
@@ -320,7 +323,8 @@ class CalendarSync:
             'added': synced_count,
             'deleted': deleted_count,
             'added_events': added_events,
-            'deleted_events': deleted_events
+            'deleted_events': deleted_events,
+            'errors': error_count
         }
 
     def sync_icloud_to_google(self, google_service, icloud_calendar):
@@ -334,6 +338,7 @@ class CalendarSync:
         events = icloud_calendar.date_search(start=start, end=end, expand=True)
         synced_count = 0
         deleted_count = 0
+        error_count = 0
         added_events = []
         deleted_events = []
 
@@ -450,6 +455,15 @@ class CalendarSync:
                         })
                     except Exception as e:
                         print(f"  ✗ Error: {e}")
+                        self.state['synced_events'][event_id] = {
+                            'title': str(component.get('summary')),
+                            'synced_at': datetime.now().isoformat(),
+                            'source': 'icloud',
+                            'start': event_start,
+                            'sync_failed': True,
+                            'error': str(e),
+                        }
+                        error_count += 1
 
         # Detect deletions: events that were synced from iCloud but no longer exist
         # Only check events that fall within the current time window
@@ -522,12 +536,13 @@ class CalendarSync:
 
             total_added = google_result['added'] + icloud_result['added']
             total_deleted = google_result['deleted'] + icloud_result['deleted']
+            total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0)
 
             message = f"✓ Sync complete: {google_result['added']} from Google, {icloud_result['added']} from iCloud"
             print(f"\n{message}\n")
 
             # Send notification if any events were added or deleted
-            if total_added > 0 or total_deleted > 0:
+            if total_added > 0 or total_deleted > 0 or total_errors > 0:
                 notification_parts = []
 
                 # Added events from Google
@@ -565,6 +580,12 @@ class CalendarSync:
                         notification_parts.append(f"  - {evt['title']} ({date_str})")
                     if icloud_result['deleted'] > 5:
                         notification_parts.append(f"  ... and {icloud_result['deleted'] - 5} more")
+
+                # Include error count if any errors occurred
+                if google_result['errors'] > 0:
+                    notification_parts.append(f"  ✗ {google_result['errors']} errors occurred from Google")
+                if icloud_result['errors'] > 0:
+                    notification_parts.append(f"  ✗ {icloud_result['errors']} errors occurred from iCloud")
 
                 notification_message = "\n".join(notification_parts)
                 self.send_notification("Calendar Sync", notification_message)
