@@ -93,7 +93,7 @@ class CalendarSync:
             json.dump(self.state, f, indent=2)
 
     def send_notification(self, title, message):
-        """Send notification to notify.sh"""
+        """Send notification to ntfy.sh"""
         notify_url = self.config.get('notify_url')
         if not notify_url:
             logger.info(f"Notification: {title} - {message}")
