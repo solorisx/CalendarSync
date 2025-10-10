@@ -238,6 +238,7 @@ python initial_auth.py
 1. **Time range** - Only syncs events from yesterday to +90 days
 2. **Already synced** - Check `data/sync_state.json` to see tracked events
 3. **Wrong calendar** - Verify `google_calendar_id` and `calendar_name`
+4. **API errors** - Rate limits, by default failed syncs will not be retried, reset state as below
 
 **To reset sync state:**
 ```bash

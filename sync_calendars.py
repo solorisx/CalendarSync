@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
 """
 Bidirectional Calendar Sync: Google Calendar <-> iCloud
-With notify.sh notifications
+With ntfy.sh notifications
 """
 
 import os
 import sys
 import json
 import pickle
-import caldav
 import requests
 import time
 import logging
-import traceback
-from datetime import datetime, timedelta
-from pathlib import Path
+import warnings
+from contextlib import redirect_stderr
+from io import StringIO
+from datetime import datetime, timedelta, timezone
 from icalendar import Calendar, Event
-from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+import caldav
 
-if False:
-    # Enable detailed HTTP logging for caldav
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.getLogger('caldav').setLevel(logging.DEBUG)
-    # Also enable urllib3 logging to see raw HTTP requests and request bodies
-    logging.getLogger('urllib3').setLevel(logging.DEBUG)
-    # Enable HTTP request/response body logging
-    import http.client
-    http.client.HTTPConnection.debuglevel = 1
+# Context manager to suppress caldav error output
+class SuppressCaldavOutput:
+    def __enter__(self):
+        self.old_stderr = sys.stderr
+        sys.stderr = StringIO()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stderr = self.old_stderr
+        return False
 
 # Configuration
 CONFIG_FILE = '/app/data/config.json'
@@ -39,6 +40,32 @@ CREDENTIALS_FILE = '/app/data/credentials.json'
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', '900'))  # 15 minutes default
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()  # DEBUG, INFO, WARNING, ERROR
+
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+for handler in logging.root.handlers:
+    handler.setFormatter(logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S'))
+    handler.setLevel(getattr(logging, LOG_LEVEL))
+logging.root.setLevel(getattr(logging, LOG_LEVEL))
+
+logger = logging.getLogger(__name__)
+logger.propagate = False  # Prevent duplicate logs
+
+# Add handler to logger explicitly
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S'))
+logger.addHandler(handler)
+logger.setLevel(getattr(logging, LOG_LEVEL))
+
+# Configure third-party library logging
+if LOG_LEVEL == 'DEBUG':
+    # Enable detailed HTTP logging for caldav and Google API
+    logging.getLogger('caldav').setLevel(logging.DEBUG)
+    logging.getLogger('urllib3').setLevel(logging.INFO)  # Too verbose at DEBUG
+    logging.getLogger('googleapiclient').setLevel(logging.INFO)
+else:
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('googleapiclient').setLevel(logging.WARNING)
 
 class CalendarSync:
     def __init__(self):
@@ -48,7 +75,7 @@ class CalendarSync:
     def load_config(self):
         """Load configuration from file"""
         if not os.path.exists(CONFIG_FILE):
-            print(f"Error: {CONFIG_FILE} not found. Please create it.")
+            logger.error(f"{CONFIG_FILE} not found. Please create it.")
             sys.exit(1)
         with open(CONFIG_FILE, 'r') as f:
             return json.load(f)
@@ -69,17 +96,17 @@ class CalendarSync:
         """Send notification to notify.sh"""
         notify_url = self.config.get('notify_url')
         if not notify_url:
-            print(f"Notification: {title} - {message}")
+            logger.info(f"Notification: {title} - {message}")
             return
 
         try:
             response = requests.post(notify_url, data=message.encode('utf-8'))
             if response.status_code == 200:
-                print(f"✓ Notification sent: {title}")
+                logger.info(f"Notification sent: {title}")
             else:
-                print(f"✗ Failed to send notification: {response.status_code}")
+                logger.warning(f"Failed to send notification (HTTP {response.status_code}): {title}")
         except Exception as e:
-            print(f"✗ Error sending notification: {e}")
+            logger.error(f"Error sending notification: {e}")
 
     def get_google_service(self):
         """Authenticate and return Google Calendar service"""
@@ -91,12 +118,14 @@ class CalendarSync:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
+                logger.debug("Refreshing expired Google OAuth token")
                 creds.refresh(Request())
             else:
                 if not os.path.exists(CREDENTIALS_FILE):
-                    print(f"Error: {CREDENTIALS_FILE} not found")
-                    print("Download from Google Cloud Console")
+                    logger.error(f"{CREDENTIALS_FILE} not found")
+                    logger.error("Download from Google Cloud Console")
                     sys.exit(1)
+                logger.info("Starting Google OAuth authentication flow")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     CREDENTIALS_FILE, SCOPES)
                 # Use port 8080 for Docker compatibility
@@ -104,6 +133,7 @@ class CalendarSync:
 
             with open(TOKEN_FILE, 'wb') as token:
                 pickle.dump(creds, token)
+            logger.debug("Google OAuth token saved")
 
         return build('calendar', 'v3', credentials=creds)
 
@@ -135,11 +165,11 @@ class CalendarSync:
     def sync_google_to_icloud(self, google_service, icloud_calendar):
 
         """Sync events from Google Calendar to iCloud"""
-        print("→ Syncing Google → iCloud...")
+        logger.info("→ Syncing Google → iCloud...")
 
-        now = datetime.utcnow()
-        time_min = (now - timedelta(days=1)).isoformat() + 'Z'
-        time_max = (now + timedelta(days=90)).isoformat() + 'Z'
+        now = datetime.now(timezone.utc)
+        time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+        time_max = (now + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
 
         events_result = google_service.events().list(
             calendarId=self.config['google_calendar_id'],
@@ -162,11 +192,12 @@ class CalendarSync:
         # Get existing iCloud events to check for duplicates
         existing_icloud_events = {}
         try:
-            icloud_events = icloud_calendar.date_search(
-                start=now - timedelta(days=1),
-                end=now + timedelta(days=90),
-                expand=True
-            )
+            with SuppressCaldavOutput():
+                icloud_events = icloud_calendar.date_search(
+                    start=now - timedelta(days=1),
+                    end=now + timedelta(days=90),
+                    expand=True
+                )
             for icloud_event in icloud_events:
                 try:
                     ical = Calendar.from_ical(icloud_event.data)
@@ -186,7 +217,7 @@ class CalendarSync:
                 except:
                     pass
         except Exception as e:
-            print(f"  ⚠ Warning: Could not fetch existing iCloud events: {e}")
+            logger.warning(f"Could not fetch existing iCloud events: {e}")
 
         # Add new events
         for event in events:
@@ -211,7 +242,7 @@ class CalendarSync:
                     'source': 'icloud' if event.get('iCalUID') else 'google',
                     'start': event_start
                 }
-                print(f"  ⊘ {event.get('summary')} (already exists in iCloud)")
+                logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
                 continue
 
             # Create iCloud event
@@ -254,9 +285,9 @@ class CalendarSync:
                     'title': event.get('summary'),
                     'start': event_start
                 })
-                print(f"  ✓ {event.get('summary')}")
+                logger.info(f"Added to iCloud: {event.get('summary')}")
             except Exception as e:
-                print(f"  ✗ Error syncing '{event.get('summary')}': {e}")
+                logger.error(f"Failed to sync '{event.get('summary')}': {e}")
                 # Still mark as synced to avoid retrying on every sync
                 self.state['synced_events'][event_uid] = {
                     'title': event.get('summary'),
@@ -308,16 +339,16 @@ class CalendarSync:
                                         'title': event_info['title'],
                                         'start': event_info.get('start', 'unknown')
                                     })
-                                    print(f"  ✗ Deleted: {event_info['title']}")
+                                    logger.info(f"Deleted from iCloud: {event_info['title']}")
                                     del self.state['synced_events'][event_id]
                                     break
                     except:
                         pass
             except Exception as e:
-                print(f"  ✗ Error deleting event: {e}")
+                logger.error(f"Error deleting event: {e}")
 
         if deleted_count > 0:
-            print(f"  Deleted {deleted_count} event(s) from iCloud")
+            logger.info(f"Deleted {deleted_count} event(s) from iCloud")
 
         return {
             'added': synced_count,
@@ -329,13 +360,14 @@ class CalendarSync:
 
     def sync_icloud_to_google(self, google_service, icloud_calendar):
         """Sync events from iCloud to Google Calendar"""
-        print("← Syncing iCloud → Google...")
+        logger.info("← Syncing iCloud → Google...")
 
         now = datetime.now()
         start = now - timedelta(days=1)
         end = now + timedelta(days=90)
 
-        events = icloud_calendar.date_search(start=start, end=end, expand=True)
+        with SuppressCaldavOutput():
+            events = icloud_calendar.date_search(start=start, end=end, expand=True)
         synced_count = 0
         deleted_count = 0
         error_count = 0
@@ -362,15 +394,15 @@ class CalendarSync:
                 event_uid = g_event.get('iCalUID', g_event['id'])
                 existing_google_events[event_uid] = g_event
         except Exception as e:
-            print(f"  ⚠ Warning: Could not fetch existing Google events: {e}")
+            logger.warning(f"Could not fetch existing Google events: {e}")
 
         # Add new events
-        print(f"  Processing {len(events)} iCloud events...")
+        logger.debug(f"Processing {len(events)} iCloud events...")
         for event in events:
             try:
                 ical = Calendar.from_ical(event.data)
             except Exception as e:
-                print(f"  ✗ Error parsing event: {e}")
+                logger.error(f"Error parsing event: {e}")
                 continue
 
             for component in ical.walk():
@@ -380,11 +412,9 @@ class CalendarSync:
                     # For recurring event instances, create unique ID with recurrence-id or dtstart
                     recurrence_id = component.get('recurrence-id')
                     if recurrence_id:
-                        # This is a specific instance of a recurring event
                         recurrence_str = recurrence_id.dt.isoformat() if hasattr(recurrence_id.dt, 'isoformat') else str(recurrence_id.dt)
                         event_id = f"{uid}_{recurrence_str}"
                     else:
-                        # Single event or master recurring event
                         event_id = uid
 
                     current_icloud_ids.add(event_id)
@@ -403,7 +433,7 @@ class CalendarSync:
                             'source': 'icloud',
                             'start': event_start
                         }
-                        print(f"  ⊘ {component.get('summary')} (already exists in Google)")
+                        logger.debug(f"Skipped (already exists in Google): {component.get('summary')}")
                         continue
 
                     dtstart = component.get('dtstart').dt
@@ -433,7 +463,7 @@ class CalendarSync:
                     if component.get('description'):
                         google_event['description'] = str(component.get('description'))
 
-                    print(f"  Adding event to Google: {google_event['summary']} ({start_dict})")
+                    logger.debug(f"Adding event to Google: {google_event['summary']} ({start_dict})")
 
                     try:
                         google_service.events().insert(
@@ -453,8 +483,9 @@ class CalendarSync:
                             'title': str(component.get('summary')),
                             'start': event_start
                         })
+                        logger.info(f"Added to Google: {component.get('summary')}")
                     except Exception as e:
-                        print(f"  ✗ Error: {e}")
+                        logger.error(f"Failed to add event to Google: {e}")
                         self.state['synced_events'][event_id] = {
                             'title': str(component.get('summary')),
                             'synced_at': datetime.now().isoformat(),
@@ -498,29 +529,32 @@ class CalendarSync:
                     'title': event_info['title'],
                     'start': event_info.get('start', 'unknown')
                 })
-                print(f"  ✗ Deleted: {event_info['title']}")
+                logger.info(f"Deleted from Google: {event_info['title']}")
                 del self.state['synced_events'][event_id]
             except Exception as e:
                 # Event might already be deleted or not found
+                logger.debug(f"Could not delete event {event_id}: {e}")
                 if event_id in self.state['synced_events']:
                     del self.state['synced_events'][event_id]
 
         if deleted_count > 0:
-            print(f"  Deleted {deleted_count} event(s) from Google")
+            logger.info(f"Deleted {deleted_count} event(s) from Google")
 
         return {
             'added': synced_count,
             'deleted': deleted_count,
             'added_events': added_events,
-            'deleted_events': deleted_events
+            'deleted_events': deleted_events,
+            'errors': error_count
         }
 
     def run_sync(self):
         """Execute bidirectional sync"""
+        start_time = time.time()
         try:
-            print(f"\n{'='*60}")
-            print(f"Starting sync at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"{'='*60}")
+            logger.info("="*60)
+            logger.info(f"Starting sync at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("="*60)
 
             google_service = self.get_google_service()
             icloud_calendar = self.get_icloud_calendar()
@@ -538,8 +572,18 @@ class CalendarSync:
             total_deleted = google_result['deleted'] + icloud_result['deleted']
             total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0)
 
-            message = f"✓ Sync complete: {google_result['added']} from Google, {icloud_result['added']} from iCloud"
-            print(f"\n{message}\n")
+            # Calculate elapsed time
+            elapsed = time.time() - start_time
+            if elapsed < 60:
+                time_str = f"{elapsed:.1f}s"
+            else:
+                minutes = int(elapsed // 60)
+                seconds = elapsed % 60
+                time_str = f"{minutes}m {seconds:.1f}s"
+
+            message = f"Sync complete: {google_result['added']} from Google, {icloud_result['added']} from iCloud, {google_result['deleted']} deleted from iCloud, {icloud_result['deleted']} deleted from Google"
+            message += f", {total_errors} errors occurred in {time_str}"
+            logger.info(message)
 
             # Send notification if any events were added or deleted
             if total_added > 0 or total_deleted > 0 or total_errors > 0:
@@ -593,10 +637,18 @@ class CalendarSync:
             return True
 
         except Exception as e:
-            error_msg = f"✗ Sync failed: {str(e)}"
-            print(f"\n{error_msg}\n")
+            # Calculate elapsed time for error case
+            elapsed = time.time() - start_time
+            if elapsed < 60:
+                time_str = f"{elapsed:.1f}s"
+            else:
+                minutes = int(elapsed // 60)
+                seconds = elapsed % 60
+                time_str = f"{minutes}m {seconds:.1f}s"
 
-            traceback.print_exc()
+            error_msg = f"Sync failed after {time_str}: {str(e)}"
+            logger.error(error_msg)
+            logger.debug("Full traceback:", exc_info=True)
 
             # Only send notification if this is a new/different error
             last_error = self.state.get('last_error')
@@ -609,14 +661,14 @@ class CalendarSync:
 
 def main():
     """Main loop with scheduled syncing"""
-    print("Calendar Sync Service Starting...")
-    print(f"Sync interval: {SYNC_INTERVAL} seconds")
+    logger.info("Calendar Sync Service Starting...")
+    logger.info(f"Sync interval: {SYNC_INTERVAL} seconds (log level: {LOG_LEVEL})")
 
     sync = CalendarSync()
 
     while True:
         sync.run_sync()
-        print(f"Next sync in {SYNC_INTERVAL} seconds...")
+        logger.info(f"Next sync in {SYNC_INTERVAL} seconds...")
         time.sleep(SYNC_INTERVAL)
 
 if __name__ == "__main__":
