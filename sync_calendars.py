@@ -15,7 +15,7 @@ import warnings
 from contextlib import redirect_stderr
 from io import StringIO
 from datetime import datetime, timedelta, timezone
-from icalendar import Calendar, Event
+from icalendar import Calendar, Event, Alarm
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -269,6 +269,13 @@ class CalendarSync:
             ical_event.add('dtend', end_dt)
             ical_event.add('uid', event_uid)
 
+            # Add 30-minute reminder
+            alarm = Alarm()
+            alarm.add('action', 'DISPLAY')
+            alarm.add('trigger', timedelta(minutes=-30))
+            alarm.add('description', 'Reminder')
+            ical_event.add_component(alarm)
+
             cal.add_component(ical_event)
 
             try:
@@ -458,6 +465,12 @@ class CalendarSync:
                         'start': start_dict,
                         'end': end_dict,
                         'iCalUID': event_id,  # Preserve the original UID
+                        'reminders': {
+                            'useDefault': False,
+                            'overrides': [
+                                {'method': 'popup', 'minutes': 30},
+                            ]
+                        }
                     }
 
                     if component.get('description'):
