@@ -171,6 +171,9 @@ class CalendarSync:
         time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
         time_max = (now + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
 
+        logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
+        logger.debug(f"Time range: {time_min} to {time_max}")
+
         events_result = google_service.events().list(
             calendarId=self.config['google_calendar_id'],
             timeMin=time_min,
@@ -179,15 +182,21 @@ class CalendarSync:
             orderBy='startTime'
         ).execute()
 
+        logger.debug(f"Google API response keys: {events_result.keys()}")
+        logger.info(f"Fetched {events_result.get('totalItems', 0)} events from Google Calendar")
+
         events = events_result.get('items', [])
+        logger.debug(f"Number of events in 'items': {len(events)}")
         synced_count = 0
         deleted_count = 0
         error_count = 0
         added_events = []
         deleted_events = []
 
-        # Track current Google event UIDs (using iCalUID if available, otherwise event ID)
-        current_google_ids = {event.get('iCalUID', event['id']) for event in events}
+        # Track current Google event UIDs (use plain event ID, not iCalUID)
+        # We use event['id'] to match what we store in sync_state
+        current_google_ids = {event['id'] for event in events}
+        logger.debug(f"Current Google event IDs: {len(current_google_ids)} unique events")
 
         # Get existing iCloud events to check for duplicates
         existing_icloud_events = {}
@@ -220,16 +229,24 @@ class CalendarSync:
             logger.warning(f"Could not fetch existing iCloud events: {e}")
 
         # Add new events
+        logger.debug(f"Processing {len(events)} Google events...")
         for event in events:
-
-            if event.get('iCalUID'):
-                # source is iCloud
-                continue
-
             event_uid = event['id']
+            event_title = event.get('summary', 'No Title')
+            logger.debug(f"Checking event: {event_title} (ID: {event_uid}, iCalUID: {event.get('iCalUID')})")
+
+            # Check if event originated from iCloud by comparing iCalUID with event ID
+            # Google native events have iCalUID that matches their ID (often with @google.com)
+            # iCloud synced events have iCalUID that differs from the Google event ID
+            ical_uid = event.get('iCalUID', '')
+            if ical_uid and not ical_uid.startswith(event_uid):
+                # source is iCloud (iCalUID is different from Google's event ID)
+                logger.debug(f"  Skipping: Event originated from iCloud (iCalUID doesn't match event ID)")
+                continue
 
             if event_uid in self.state['synced_events']:
                 # already synced
+                logger.debug(f"  Skipping: Already in sync state")
                 continue
 
             # Check if event already exists in iCloud (by UID)
