@@ -452,7 +452,7 @@ class CalendarSync:
                         dtstart = component.get('dtstart').dt
                         event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
                         self.state['synced_events'][event_id] = {
-                            'title': str(component.get('summary')),
+                            'title': str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
                             'start': event_start
@@ -502,22 +502,23 @@ class CalendarSync:
                         ).execute()
 
                         event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
+                        event_title = str(component.get('summary')) + (" (recurring)" if recurrence_id else "")
                         self.state['synced_events'][event_id] = {
-                            'title': str(component.get('summary')),
+                            'title': event_title,
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
                             'start': event_start
                         }
-                        synced_count += 1
+                        synced_count += 1 if not recurrence_id else 0  # Count only master events
                         added_events.append({
-                            'title': str(component.get('summary')),
+                            'title': event_title,
                             'start': event_start
                         })
-                        logger.info(f"Added to Google: {component.get('summary')}")
+                        logger.info(f"Added to Google: {event_title}")
                     except Exception as e:
                         logger.error(f"Failed to add event to Google: {e}")
                         self.state['synced_events'][event_id] = {
-                            'title': str(component.get('summary')),
+                            'title': event_title,
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
                             'start': event_start,
