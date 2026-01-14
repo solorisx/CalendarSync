@@ -8,6 +8,13 @@ REMOTE_HOST="${REMOTE_HOST:-raspberrypi}"
 REMOTE_USER="${REMOTE_USER:-pi}"
 REMOTE_PATH="${REMOTE_PATH:-~/CalendarSync}"
 
+# Use docker compose (v2) or docker-compose (v1) depending on availability
+if command -v docker-compose &> /dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    DOCKER_COMPOSE="docker compose"
+fi
+
 # Default to local
 MODE="${1:-local}"
 
@@ -15,7 +22,7 @@ case "$MODE" in
     local)
         echo "→ Triggering local sync now..."
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        docker-compose exec calendar-sync python sync_once.py
+        $DOCKER_COMPOSE exec calendar-sync python sync_once.py
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "✓ Sync complete"
         ;;
@@ -23,7 +30,7 @@ case "$MODE" in
     remote)
         echo "→ Triggering remote sync on $REMOTE_USER@$REMOTE_HOST..."
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        ssh -t "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_PATH && docker-compose exec -T calendar-sync python sync_once.py"
+        ssh -t "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_PATH && docker compose exec -T calendar-sync python sync_once.py"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "✓ Sync complete"
         ;;

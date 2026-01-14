@@ -92,6 +92,69 @@ class CalendarSync:
         with open(STATE_FILE, 'w') as f:
             json.dump(self.state, f, indent=2)
 
+    def cleanup_google_orphans(self, dry_run=True):
+        """Delete events from Google Calendar that are not in sync state.
+
+        Args:
+            dry_run: If True, only show what would be deleted without actually deleting
+        """
+        google_service = self.get_google_service()
+
+        now = datetime.now(timezone.utc)
+        time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+        time_max = (now + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
+
+        # Get all Google events
+        events_result = google_service.events().list(
+            calendarId=self.config['google_calendar_id'],
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+        logger.info(f"Found {len(events)} events in Google Calendar")
+
+        # Get synced event IDs (both as event ID and iCalUID)
+        synced_ids = set(self.state['synced_events'].keys())
+
+        orphans = []
+        for event in events:
+            event_id = event['id']
+            ical_uid = event.get('iCalUID', '')
+
+            # Check if event is in sync state (by either ID or iCalUID)
+            if event_id not in synced_ids and ical_uid not in synced_ids:
+                orphans.append(event)
+
+        if not orphans:
+            logger.info("No orphan events found")
+            return
+
+        logger.info(f"Found {len(orphans)} orphan event(s) not in sync state:")
+        for event in orphans:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            logger.info(f"  - {event.get('summary', 'No Title')} ({start})")
+
+        if dry_run:
+            logger.info("Dry run - no events deleted. Call with dry_run=False to delete.")
+            return
+
+        deleted_count = 0
+        for event in orphans:
+            try:
+                google_service.events().delete(
+                    calendarId=self.config['google_calendar_id'],
+                    eventId=event['id']
+                ).execute()
+                deleted_count += 1
+                logger.info(f"Deleted: {event.get('summary', 'No Title')}")
+            except Exception as e:
+                logger.error(f"Failed to delete {event.get('summary')}: {e}")
+
+        logger.info(f"Deleted {deleted_count} orphan event(s) from Google Calendar")
+
     def send_notification(self, title, message):
         """Send notification to ntfy.sh"""
         notify_url = self.config.get('notify_url')
@@ -326,10 +389,12 @@ class CalendarSync:
         # Detect deletions: events that were synced from Google but no longer exist
         # Only check events that fall within the current time window
         events_to_delete = []
+        logger.debug(f"Checking for deleted Google events. Synced events count: {len(self.state['synced_events'])}")
         for event_id, event_info in self.state['synced_events'].items():
             if event_info.get('source') == 'google':
                 # Check if event is within the time window
                 event_start = event_info.get('start')
+                logger.debug(f"Checking synced event: {event_info.get('title')} (ID: {event_id}, start: {event_start})")
                 if event_start:
                     try:
                         # Parse the event start time
@@ -337,25 +402,53 @@ class CalendarSync:
                         # Only consider for deletion if within our query window
                         if time_min <= event_dt.isoformat() <= time_max:
                             if event_id not in current_google_ids:
+                                logger.debug(f"  → Marked for deletion: not in current Google events")
                                 events_to_delete.append(event_id)
-                    except:
+                            else:
+                                logger.debug(f"  → Still exists in Google")
+                        else:
+                            logger.debug(f"  → Outside time window (event: {event_dt.isoformat()}, window: {time_min} to {time_max})")
+                    except Exception as e:
                         # If we can't parse the date, skip this event
-                        pass
+                        logger.debug(f"  → Could not parse date: {e}")
 
         # Delete events from iCloud that were deleted from Google
+        logger.debug(f"Events to delete from iCloud: {len(events_to_delete)}")
         for event_id in events_to_delete:
+            logger.debug(f"Attempting to delete event from iCloud: {event_id}")
             try:
                 # Find and delete the event in iCloud by UID
-                icloud_events = icloud_calendar.date_search(
-                    start=now - timedelta(days=365),
-                    end=now + timedelta(days=365)
-                )
+                with SuppressCaldavOutput():
+                    icloud_events = icloud_calendar.date_search(
+                        start=now - timedelta(days=365),
+                        end=now + timedelta(days=365),
+                        expand=True  # Expand recurring events to find instances
+                    )
+                logger.debug(f"  Searching through {len(list(icloud_events))} iCloud events")
+                # Re-fetch since we consumed the iterator
+                with SuppressCaldavOutput():
+                    icloud_events = icloud_calendar.date_search(
+                        start=now - timedelta(days=365),
+                        end=now + timedelta(days=365),
+                        expand=True
+                    )
+                found = False
                 for icloud_event in icloud_events:
                     try:
                         ical = Calendar.from_ical(icloud_event.data)
                         for component in ical.walk():
                             if component.name == "VEVENT":
-                                if str(component.get('uid')) == event_id:
+                                icloud_uid = str(component.get('uid'))
+                                recurrence_id = component.get('recurrence-id')
+                                # Build the same ID format we use for tracking
+                                if recurrence_id:
+                                    recurrence_str = recurrence_id.dt.isoformat() if hasattr(recurrence_id.dt, 'isoformat') else str(recurrence_id.dt)
+                                    full_uid = f"{icloud_uid}_{recurrence_str}"
+                                else:
+                                    full_uid = icloud_uid
+                                logger.debug(f"    Comparing: iCloud UID={full_uid} vs target={event_id}")
+                                if full_uid == event_id or icloud_uid == event_id:
+                                    logger.debug(f"    → Match found! Deleting...")
                                     icloud_event.delete()
                                     deleted_count += 1
                                     event_info = self.state['synced_events'][event_id]
@@ -365,11 +458,19 @@ class CalendarSync:
                                     })
                                     logger.info(f"Deleted from iCloud: {event_info['title']}")
                                     del self.state['synced_events'][event_id]
+                                    found = True
                                     break
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"    Error parsing iCloud event: {e}")
+                    if found:
+                        break
+                if not found:
+                    logger.warning(f"Could not find event {event_id} in iCloud to delete")
+                    # Remove from state anyway to avoid retrying
+                    if event_id in self.state['synced_events']:
+                        del self.state['synced_events'][event_id]
             except Exception as e:
-                logger.error(f"Error deleting event: {e}")
+                logger.error(f"Error deleting event {event_id}: {e}")
 
         if deleted_count > 0:
             logger.info(f"Deleted {deleted_count} event(s) from iCloud")
@@ -386,7 +487,7 @@ class CalendarSync:
         """Sync events from iCloud to Google Calendar"""
         logger.info("← Syncing iCloud → Google...")
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         start = now - timedelta(days=1)
         end = now + timedelta(days=90)
 
@@ -530,24 +631,40 @@ class CalendarSync:
         # Detect deletions: events that were synced from iCloud but no longer exist
         # Only check events that fall within the current time window
         events_to_delete = []
+        logger.debug(f"Checking for deleted iCloud events. Synced events count: {len(self.state['synced_events'])}")
+        logger.debug(f"Current iCloud IDs: {current_icloud_ids}")
         for event_id, event_info in self.state['synced_events'].items():
             if event_info.get('source') == 'icloud':
                 # Check if event is within the time window
                 event_start = event_info.get('start')
+                logger.debug(f"Checking synced event: {event_info.get('title')} (ID: {event_id}, start: {event_start})")
                 if event_start:
                     try:
                         # Parse the event start time
                         event_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                        # Convert to UTC for comparison
+                        if event_dt.tzinfo is not None:
+                            event_dt = event_dt.astimezone(timezone.utc)
+                        else:
+                            # Assume UTC if no timezone
+                            event_dt = event_dt.replace(tzinfo=timezone.utc)
                         # Only consider for deletion if within our query window
                         if start <= event_dt <= end:
                             if event_id not in current_icloud_ids:
+                                logger.debug(f"  → Marked for deletion: not in current iCloud events")
                                 events_to_delete.append(event_id)
-                    except:
+                            else:
+                                logger.debug(f"  → Still exists in iCloud")
+                        else:
+                            logger.debug(f"  → Outside time window (event: {event_dt}, window: {start} to {end})")
+                    except Exception as e:
                         # If we can't parse the date, skip this event
-                        pass
+                        logger.debug(f"  → Could not parse date: {e}")
 
         # Delete events from Google that were deleted from iCloud
+        logger.debug(f"Events to delete from Google: {len(events_to_delete)}")
         for event_id in events_to_delete:
+            logger.debug(f"Attempting to delete event from Google: {event_id}")
             try:
                 # Search for the event in Google Calendar by ID
                 google_service.events().delete(
@@ -563,10 +680,8 @@ class CalendarSync:
                 logger.info(f"Deleted from Google: {event_info['title']}")
                 del self.state['synced_events'][event_id]
             except Exception as e:
-                # Event might already be deleted or not found
-                logger.debug(f"Could not delete event {event_id}: {e}")
-                if event_id in self.state['synced_events']:
-                    del self.state['synced_events'][event_id]
+                # Event might already be deleted or not found - keep in state to retry later
+                logger.warning(f"Could not delete event {event_id} from Google: {e}")
 
         if deleted_count > 0:
             logger.info(f"Deleted {deleted_count} event(s) from Google")

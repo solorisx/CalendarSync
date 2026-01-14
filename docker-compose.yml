@@ -6,5 +6,5 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      - SYNC_INTERVAL=900  # 15 minutes (in seconds)
-      - LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-900}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
