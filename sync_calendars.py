@@ -237,18 +237,23 @@ class CalendarSync:
         logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
         logger.debug(f"Time range: {time_min} to {time_max}")
 
-        events_result = google_service.events().list(
-            calendarId=self.config['google_calendar_id'],
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
+        events = []
+        page_token = None
+        while True:
+            events_result = google_service.events().list(
+                calendarId=self.config['google_calendar_id'],
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy='startTime',
+                pageToken=page_token
+            ).execute()
+            events.extend(events_result.get('items', []))
+            page_token = events_result.get('nextPageToken')
+            if not page_token:
+                break
 
-        logger.debug(f"Google API response keys: {events_result.keys()}")
-        logger.info(f"Fetched {events_result.get('totalItems', 0)} events from Google Calendar")
-
-        events = events_result.get('items', [])
+        logger.info(f"Fetched {len(events)} events from Google Calendar")
         logger.debug(f"Number of events in 'items': {len(events)}")
         synced_count = 0
         deleted_count = 0
@@ -505,15 +510,29 @@ class CalendarSync:
         # Get existing Google events to check for duplicates
         existing_google_events = {}
         try:
-            time_min = (now - timedelta(days=1)).isoformat() + 'Z'
-            time_max = (now + timedelta(days=90)).isoformat() + 'Z'
-            google_events_result = google_service.events().list(
-                calendarId=self.config['google_calendar_id'],
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True
-            ).execute()
-            for g_event in google_events_result.get('items', []):
+            now = datetime.now(timezone.utc)
+            time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+            time_max = (now + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
+
+            logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
+            logger.debug(f"Time range: {time_min} to {time_max}")
+
+            page_token = None
+            all_google_events = []
+            while True:
+                google_events_result = google_service.events().list(
+                    calendarId=self.config['google_calendar_id'],
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy='startTime',
+                    pageToken=page_token
+                ).execute()
+                all_google_events.extend(google_events_result.get('items', []))
+                page_token = google_events_result.get('nextPageToken')
+                if not page_token:
+                    break
+            for g_event in all_google_events:
                 # Use iCalUID if available (for events synced from iCloud), otherwise use event ID
                 # iCalUID will be in format: "uid" or "uid_recurrence-datetime" for recurring instances
                 event_uid = g_event.get('iCalUID', g_event['id'])
