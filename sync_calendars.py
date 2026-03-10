@@ -11,8 +11,6 @@ import pickle
 import requests
 import time
 import logging
-import warnings
-from contextlib import redirect_stderr
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from icalendar import Calendar, Event, Alarm
@@ -91,6 +89,40 @@ class CalendarSync:
         """Save sync state"""
         with open(STATE_FILE, 'w') as f:
             json.dump(self.state, f, indent=2)
+
+    def _cleanup_past_events(self):
+        """Remove past events from sync state to keep it lean"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        to_remove = []
+        for event_id, event_info in self.state['synced_events'].items():
+            event_start = event_info.get('start')
+            if not event_start:
+                continue
+            try:
+                dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                event_date = dt.date() if isinstance(dt, datetime) else dt
+                if event_date < cutoff:
+                    to_remove.append(event_id)
+            except Exception:
+                pass
+        for event_id in to_remove:
+            del self.state['synced_events'][event_id]
+        if to_remove:
+            logger.debug(f"Removed {len(to_remove)} past event(s) from sync state")
+
+    def _record_synced_event(self, event_id, title, source, start, last_modified=None, failed=False, error=None):
+        """Record a synced event in the state"""
+        entry = {
+            'title': title,
+            'synced_at': datetime.now().isoformat(),
+            'source': source,
+            'start': start,
+            'last_modified': last_modified,
+        }
+        if failed:
+            entry['sync_failed'] = True
+            entry['error'] = error
+        self.state['synced_events'][event_id] = entry
 
     def cleanup_google_orphans(self, dry_run=True):
         """Delete events from Google Calendar that are not in sync state.
@@ -293,7 +325,7 @@ class CalendarSync:
                                 # Single event or master recurring event
                                 event_id = uid
                             existing_icloud_events[event_id] = icloud_event
-                except:
+                except Exception:
                     pass
         except Exception as e:
             logger.warning(f"Could not fetch existing iCloud events: {e}")
@@ -330,17 +362,17 @@ class CalendarSync:
                             cal = Calendar.from_ical(icloud_event.data)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    component['summary'] = event.get('summary', 'No Title')
+                                    component.pop('summary', None)
+                                    component.add('summary', event.get('summary', 'No Title'))
                                     if event.get('description'):
-                                        component['description'] = event['description']
+                                        component.pop('description', None)
+                                        component.add('description', event['description'])
                                     elif 'description' in component:
                                         del component['description']
                                     start = event['start'].get('dateTime', event['start'].get('date'))
                                     end = event['end'].get('dateTime', event['end'].get('date'))
                                     start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
                                     end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
-                                    component['dtstart'] = component.get('dtstart')
-                                    component['dtend'] = component.get('dtend')
                                     component.pop('dtstart', None)
                                     component.pop('dtend', None)
                                     component.add('dtstart', start_dt)
@@ -364,12 +396,11 @@ class CalendarSync:
             if event_uid in existing_icloud_events:
                 # Event already exists in iCloud, just record it in state
                 event_start = event['start'].get('dateTime', event['start'].get('date'))
-                self.state['synced_events'][event_uid] = {
-                    'title': event.get('summary'),
-                    'synced_at': datetime.now().isoformat(),
-                    'source': 'icloud' if event.get('iCalUID') else 'google',
-                    'start': event_start
-                }
+                self._record_synced_event(
+                    event_uid, event.get('summary'),
+                    source='icloud' if event.get('iCalUID') else 'google',
+                    start=event_start
+                )
                 logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
                 continue
 
@@ -409,13 +440,10 @@ class CalendarSync:
             try:
                 event_start = event['start'].get('dateTime', event['start'].get('date'))
                 icloud_calendar.save_event(cal.to_ical())
-                self.state['synced_events'][event_uid] = {
-                    'title': event.get('summary'),
-                    'synced_at': datetime.now().isoformat(),
-                    'source': 'google',
-                    'start': event_start,
-                    'last_modified': event.get('updated'),
-                }
+                self._record_synced_event(
+                    event_uid, event.get('summary'), source='google',
+                    start=event_start, last_modified=event.get('updated')
+                )
                 synced_count += 1
                 added_events.append({
                     'title': event.get('summary'),
@@ -425,15 +453,11 @@ class CalendarSync:
             except Exception as e:
                 logger.error(f"Failed to sync '{event.get('summary')}': {e}")
                 # Still mark as synced to avoid retrying on every sync
-                self.state['synced_events'][event_uid] = {
-                    'title': event.get('summary'),
-                    'synced_at': datetime.now().isoformat(),
-                    'source': 'google',
-                    'start': event_start,
-                    'last_modified': event.get('updated'),
-                    'sync_failed': True,
-                    'error': str(e),
-                }
+                self._record_synced_event(
+                    event_uid, event.get('summary'), source='google',
+                    start=event_start, last_modified=event.get('updated'),
+                    failed=True, error=str(e)
+                )
                 error_count += 1
 
         # Detect deletions: events that were synced from Google but no longer exist
@@ -469,19 +493,12 @@ class CalendarSync:
             try:
                 # Find and delete the event in iCloud by UID
                 with SuppressCaldavOutput():
-                    icloud_events = icloud_calendar.date_search(
-                        start=now - timedelta(days=365),
-                        end=now + timedelta(days=365),
-                        expand=True  # Expand recurring events to find instances
-                    )
-                logger.debug(f"  Searching through {len(list(icloud_events))} iCloud events")
-                # Re-fetch since we consumed the iterator
-                with SuppressCaldavOutput():
-                    icloud_events = icloud_calendar.date_search(
-                        start=now - timedelta(days=365),
-                        end=now + timedelta(days=365),
+                    icloud_events = list(icloud_calendar.date_search(
+                        start=now - timedelta(days=1),
+                        end=now + timedelta(days=90),
                         expand=True
-                    )
+                    ))
+                logger.debug(f"  Searching through {len(icloud_events)} iCloud events")
                 found = False
                 for icloud_event in icloud_events:
                     try:
@@ -561,9 +578,8 @@ class CalendarSync:
         # Get existing Google events to check for duplicates
         existing_google_events = {}
         try:
-            now = datetime.now(timezone.utc)
-            time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
-            time_max = (now + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
+            time_min = start.isoformat().replace('+00:00', 'Z')
+            time_max = end.isoformat().replace('+00:00', 'Z')
 
             logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
             logger.debug(f"Time range: {time_min} to {time_max}")
@@ -665,13 +681,11 @@ class CalendarSync:
                         # Event already exists in Google, just record it in state
                         dtstart = component.get('dtstart').dt
                         event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
-                        self.state['synced_events'][event_id] = {
-                            'title': str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
-                            'synced_at': datetime.now().isoformat(),
-                            'source': 'icloud',
-                            'start': event_start,
-                            'last_modified': last_modified,
-                        }
+                        self._record_synced_event(
+                            event_id,
+                            str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
+                            source='icloud', start=event_start, last_modified=last_modified
+                        )
                         logger.debug(f"Skipped (already exists in Google): {component.get('summary')}")
                         continue
 
@@ -718,13 +732,10 @@ class CalendarSync:
 
                         event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
                         event_title = str(component.get('summary')) + (" (recurring)" if recurrence_id else "")
-                        self.state['synced_events'][event_id] = {
-                            'title': event_title,
-                            'synced_at': datetime.now().isoformat(),
-                            'source': 'icloud',
-                            'start': event_start,
-                            'last_modified': last_modified,
-                        }
+                        self._record_synced_event(
+                            event_id, event_title, source='icloud',
+                            start=event_start, last_modified=last_modified
+                        )
                         synced_count += 1 if not recurrence_id else 0  # Count only master events
                         added_events.append({
                             'title': event_title,
@@ -733,15 +744,11 @@ class CalendarSync:
                         logger.info(f"Added to Google: {event_title}")
                     except Exception as e:
                         logger.error(f"Failed to add event to Google: {e}")
-                        self.state['synced_events'][event_id] = {
-                            'title': event_title,
-                            'synced_at': datetime.now().isoformat(),
-                            'source': 'icloud',
-                            'start': event_start,
-                            'last_modified': last_modified,
-                            'sync_failed': True,
-                            'error': str(e),
-                        }
+                        self._record_synced_event(
+                            event_id, event_title, source='icloud',
+                            start=event_start, last_modified=last_modified,
+                            failed=True, error=str(e)
+                        )
                         error_count += 1
 
         # Detect deletions: events that were synced from iCloud but no longer exist
@@ -832,6 +839,7 @@ class CalendarSync:
             # Clear last error on successful sync
             if self.state.get('last_error'):
                 self.state['last_error'] = None
+            self._cleanup_past_events()
             self.save_state()
 
             total_added = google_result['added'] + icloud_result['added']
@@ -896,7 +904,7 @@ class CalendarSync:
                 if google_result['deleted'] > 0:
                     notification_parts.append(f"Deleted {google_result['deleted']} from iCloud:")
                     for evt in google_result['deleted_events'][:5]:
-                        date_str = evt['start'][:10] if len(str(evt['start'])) > 10 else str(evt['start'])
+                        date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
                         notification_parts.append(f"  - {evt['title']} ({date_str})")
                     if google_result['deleted'] > 5:
                         notification_parts.append(f"  ... and {google_result['deleted'] - 5} more")
@@ -905,7 +913,7 @@ class CalendarSync:
                 if icloud_result['deleted'] > 0:
                     notification_parts.append(f"Deleted {icloud_result['deleted']} from Google:")
                     for evt in icloud_result['deleted_events'][:5]:
-                        date_str = evt['start'][:10] if len(str(evt['start'])) > 10 else str(evt['start'])
+                        date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
                         notification_parts.append(f"  - {evt['title']} ({date_str})")
                     if icloud_result['deleted'] > 5:
                         notification_parts.append(f"  ... and {icloud_result['deleted'] - 5} more")
