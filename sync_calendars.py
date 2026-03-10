@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import pickle
+import hashlib
 import requests
 import time
 import logging
@@ -91,6 +92,26 @@ class CalendarSync:
         """Save sync state"""
         with open(STATE_FILE, 'w') as f:
             json.dump(self.state, f, indent=2)
+
+    def _compute_google_event_hash(self, event):
+        """Compute a content hash of key Google event fields for change detection"""
+        summary = event.get('summary', '')
+        description = event.get('description', '')
+        start = event['start'].get('dateTime', event['start'].get('date', ''))
+        end = event['end'].get('dateTime', event['end'].get('date', ''))
+        content = f"{summary}|{description}|{start}|{end}"
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def _compute_icloud_event_hash(self, component):
+        """Compute a content hash of key iCloud VEVENT fields for change detection"""
+        summary = str(component.get('summary', '') or '')
+        description = str(component.get('description', '') or '')
+        dtstart = component.get('dtstart').dt
+        dtend = component.get('dtend').dt
+        start = dtstart.isoformat() if hasattr(dtstart, 'isoformat') else str(dtstart)
+        end = dtend.isoformat() if hasattr(dtend, 'isoformat') else str(dtend)
+        content = f"{summary}|{description}|{start}|{end}"
+        return hashlib.md5(content.encode()).hexdigest()
 
     def cleanup_google_orphans(self, dry_run=True):
         """Delete events from Google Calendar that are not in sync state.
@@ -256,9 +277,11 @@ class CalendarSync:
         logger.info(f"Fetched {len(events)} events from Google Calendar")
         logger.debug(f"Number of events in 'items': {len(events)}")
         synced_count = 0
+        updated_count = 0
         deleted_count = 0
         error_count = 0
         added_events = []
+        updated_events = []
         deleted_events = []
 
         # Track current Google event UIDs (use plain event ID, not iCalUID)
@@ -313,8 +336,70 @@ class CalendarSync:
                 continue
 
             if event_uid in self.state['synced_events']:
-                # already synced
-                logger.debug(f"  Skipping: Already in sync state")
+                stored = self.state['synced_events'][event_uid]
+                current_hash = self._compute_google_event_hash(event)
+                stored_hash = stored.get('content_hash')
+
+                if stored_hash is None:
+                    # Establish baseline hash without updating target
+                    stored['content_hash'] = current_hash
+                    logger.debug(f"  Stored hash baseline for: {event.get('summary')}")
+                    continue
+
+                if stored_hash == current_hash:
+                    logger.debug(f"  Skipping: Already in sync state (unchanged)")
+                    continue
+
+                # Hash differs and event was not sync_failed — update iCloud
+                if stored.get('sync_failed') or stored.get('source') != 'google':
+                    logger.debug(f"  Skipping update: sync_failed or not google-sourced")
+                    continue
+
+                logger.info(f"  Detected modification, updating in iCloud: {event.get('summary')}")
+                cal = Calendar()
+                ical_event = Event()
+                ical_event.add('summary', event.get('summary', 'No Title'))
+                if event.get('description'):
+                    ical_event.add('description', event['description'])
+
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo is not None:
+                    start_dt = start_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
+                    end_dt = end_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
+                ical_event.add('dtstart', start_dt)
+                ical_event.add('dtend', end_dt)
+                ical_event.add('uid', event_uid)
+
+                alarm = Alarm()
+                alarm.add('action', 'DISPLAY')
+                alarm.add('trigger', timedelta(minutes=-30))
+                alarm.add('description', 'Reminder')
+                ical_event.add_component(alarm)
+                cal.add_component(ical_event)
+
+                event_start = event['start'].get('dateTime', event['start'].get('date'))
+                try:
+                    if event_uid in existing_icloud_events:
+                        icloud_obj = existing_icloud_events[event_uid]
+                        icloud_obj.data = cal.to_ical()
+                        icloud_obj.save()
+                    else:
+                        icloud_calendar.save_event(cal.to_ical())
+                    stored.update({
+                        'title': event.get('summary'),
+                        'synced_at': datetime.now().isoformat(),
+                        'start': event_start,
+                        'content_hash': current_hash,
+                    })
+                    updated_count += 1
+                    updated_events.append({'title': event.get('summary'), 'start': event_start})
+                    logger.info(f"Updated in iCloud: {event.get('summary')}")
+                except Exception as e:
+                    logger.error(f"Failed to update '{event.get('summary')}' in iCloud: {e}")
+                    error_count += 1
                 continue
 
             # Check if event already exists in iCloud (by UID)
@@ -325,7 +410,8 @@ class CalendarSync:
                     'title': event.get('summary'),
                     'synced_at': datetime.now().isoformat(),
                     'source': 'icloud' if event.get('iCalUID') else 'google',
-                    'start': event_start
+                    'start': event_start,
+                    'content_hash': self._compute_google_event_hash(event),
                 }
                 logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
                 continue
@@ -371,6 +457,7 @@ class CalendarSync:
                     'synced_at': datetime.now().isoformat(),
                     'source': 'google',
                     'start': event_start,
+                    'content_hash': self._compute_google_event_hash(event),
                 }
                 synced_count += 1
                 added_events.append({
@@ -386,6 +473,7 @@ class CalendarSync:
                     'synced_at': datetime.now().isoformat(),
                     'source': 'google',
                     'start': event_start,
+                    'content_hash': self._compute_google_event_hash(event),
                     'sync_failed': True,
                     'error': str(e),
                 }
@@ -479,11 +567,15 @@ class CalendarSync:
 
         if deleted_count > 0:
             logger.info(f"Deleted {deleted_count} event(s) from iCloud")
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} event(s) in iCloud")
 
         return {
             'added': synced_count,
+            'updated': updated_count,
             'deleted': deleted_count,
             'added_events': added_events,
+            'updated_events': updated_events,
             'deleted_events': deleted_events,
             'errors': error_count
         }
@@ -499,9 +591,11 @@ class CalendarSync:
         with SuppressCaldavOutput():
             events = icloud_calendar.date_search(start=start, end=end, expand=True)
         synced_count = 0
+        updated_count = 0
         deleted_count = 0
         error_count = 0
         added_events = []
+        updated_events = []
         deleted_events = []
 
         # Track current iCloud event UIDs
@@ -564,6 +658,68 @@ class CalendarSync:
                     current_icloud_ids.add(event_id)
 
                     if event_id in self.state['synced_events']:
+                        stored = self.state['synced_events'][event_id]
+                        current_hash = self._compute_icloud_event_hash(component)
+                        stored_hash = stored.get('content_hash')
+
+                        if stored_hash is None:
+                            # Establish baseline hash without updating target
+                            stored['content_hash'] = current_hash
+                            logger.debug(f"  Stored hash baseline for: {component.get('summary')}")
+                            continue
+
+                        if stored_hash == current_hash:
+                            logger.debug(f"  Skipping: Already in sync state (unchanged)")
+                            continue
+
+                        # Hash differs — update Google if this is an iCloud-sourced event
+                        if stored.get('sync_failed') or stored.get('source') != 'icloud':
+                            logger.debug(f"  Skipping update: sync_failed or not icloud-sourced")
+                            continue
+
+                        logger.info(f"  Detected modification, updating in Google: {component.get('summary')}")
+                        dtstart = component.get('dtstart').dt
+                        dtend = component.get('dtend').dt
+                        event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
+                        event_title = str(component.get('summary')) + (" (recurring)" if recurrence_id else "")
+
+                        if isinstance(dtstart, datetime):
+                            start_dict = {'dateTime': dtstart.isoformat(), 'timeZone': 'UTC'}
+                            end_dict = {'dateTime': dtend.isoformat(), 'timeZone': 'UTC'}
+                        else:
+                            start_dict = {'date': dtstart.isoformat()}
+                            end_dict = {'date': dtend.isoformat()}
+
+                        patch_body = {
+                            'summary': str(component.get('summary', 'No Title')),
+                            'start': start_dict,
+                            'end': end_dict,
+                        }
+                        if component.get('description'):
+                            patch_body['description'] = str(component.get('description'))
+
+                        if event_id in existing_google_events:
+                            g_event = existing_google_events[event_id]
+                            try:
+                                google_service.events().patch(
+                                    calendarId=self.config['google_calendar_id'],
+                                    eventId=g_event['id'],
+                                    body=patch_body
+                                ).execute()
+                                stored.update({
+                                    'title': event_title,
+                                    'synced_at': datetime.now().isoformat(),
+                                    'start': event_start,
+                                    'content_hash': current_hash,
+                                })
+                                updated_count += 1
+                                updated_events.append({'title': event_title, 'start': event_start})
+                                logger.info(f"Updated in Google: {event_title}")
+                            except Exception as e:
+                                logger.error(f"Failed to update '{event_title}' in Google: {e}")
+                                error_count += 1
+                        else:
+                            logger.warning(f"Cannot update '{event_title}': not found in Google")
                         continue
 
                     # Check if event already exists in Google (by UID)
@@ -575,7 +731,8 @@ class CalendarSync:
                             'title': str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
-                            'start': event_start
+                            'start': event_start,
+                            'content_hash': self._compute_icloud_event_hash(component),
                         }
                         logger.debug(f"Skipped (already exists in Google): {component.get('summary')}")
                         continue
@@ -627,7 +784,8 @@ class CalendarSync:
                             'title': event_title,
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
-                            'start': event_start
+                            'start': event_start,
+                            'content_hash': self._compute_icloud_event_hash(component),
                         }
                         synced_count += 1 if not recurrence_id else 0  # Count only master events
                         added_events.append({
@@ -642,6 +800,7 @@ class CalendarSync:
                             'synced_at': datetime.now().isoformat(),
                             'source': 'icloud',
                             'start': event_start,
+                            'content_hash': self._compute_icloud_event_hash(component),
                             'sync_failed': True,
                             'error': str(e),
                         }
@@ -704,11 +863,15 @@ class CalendarSync:
 
         if deleted_count > 0:
             logger.info(f"Deleted {deleted_count} event(s) from Google")
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} event(s) in Google")
 
         return {
             'added': synced_count,
+            'updated': updated_count,
             'deleted': deleted_count,
             'added_events': added_events,
+            'updated_events': updated_events,
             'deleted_events': deleted_events,
             'errors': error_count
         }
@@ -734,6 +897,7 @@ class CalendarSync:
             self.save_state()
 
             total_added = google_result['added'] + icloud_result['added']
+            total_updated = google_result.get('updated', 0) + icloud_result.get('updated', 0)
             total_deleted = google_result['deleted'] + icloud_result['deleted']
             total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0)
 
@@ -746,12 +910,19 @@ class CalendarSync:
                 seconds = elapsed % 60
                 time_str = f"{minutes}m {seconds:.1f}s"
 
-            message = f"Sync complete: {google_result['added']} from Google, {icloud_result['added']} from iCloud, {google_result['deleted']} deleted from iCloud, {icloud_result['deleted']} deleted from Google"
-            message += f", {total_errors} errors occurred in {time_str}"
+            message = (
+                f"Sync complete: {google_result['added']} added from Google, "
+                f"{icloud_result['added']} added from iCloud, "
+                f"{google_result.get('updated', 0)} updated in iCloud, "
+                f"{icloud_result.get('updated', 0)} updated in Google, "
+                f"{google_result['deleted']} deleted from iCloud, "
+                f"{icloud_result['deleted']} deleted from Google"
+                f", {total_errors} errors occurred in {time_str}"
+            )
             logger.info(message)
 
-            # Send notification if any events were added or deleted
-            if total_added > 0 or total_deleted > 0 or total_errors > 0:
+            # Send notification if any events were added, updated, or deleted
+            if total_added > 0 or total_updated > 0 or total_deleted > 0 or total_errors > 0:
                 notification_parts = []
 
                 # Added events from Google
@@ -771,6 +942,24 @@ class CalendarSync:
                         notification_parts.append(f"  + {evt['title']} ({date_str})")
                     if icloud_result['added'] > 5:
                         notification_parts.append(f"  ... and {icloud_result['added'] - 5} more")
+
+                # Updated events in iCloud (modified Google events)
+                if google_result.get('updated', 0) > 0:
+                    notification_parts.append(f"Updated {google_result['updated']} in iCloud:")
+                    for evt in google_result['updated_events'][:5]:
+                        date_str = evt['start'][:10] if len(str(evt['start'])) > 10 else str(evt['start'])
+                        notification_parts.append(f"  ~ {evt['title']} ({date_str})")
+                    if google_result['updated'] > 5:
+                        notification_parts.append(f"  ... and {google_result['updated'] - 5} more")
+
+                # Updated events in Google (modified iCloud events)
+                if icloud_result.get('updated', 0) > 0:
+                    notification_parts.append(f"Updated {icloud_result['updated']} in Google:")
+                    for evt in icloud_result['updated_events'][:5]:
+                        date_str = evt['start'][:10] if len(str(evt['start'])) > 10 else str(evt['start'])
+                        notification_parts.append(f"  ~ {evt['title']} ({date_str})")
+                    if icloud_result['updated'] > 5:
+                        notification_parts.append(f"  ... and {icloud_result['updated'] - 5} more")
 
                 # Deleted events from Google
                 if google_result['deleted'] > 0:
