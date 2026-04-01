@@ -39,6 +39,8 @@ CREDENTIALS_FILE = '/app/data/credentials.json'
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', '900'))  # 15 minutes default
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '172800'))  # 48 hours default
+HEARTBEAT_DAY_START = int(os.getenv('HEARTBEAT_DAY_START', '8'))   # hour (0-23), inclusive
+HEARTBEAT_DAY_END = int(os.getenv('HEARTBEAT_DAY_END', '22'))       # hour (0-23), exclusive
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()  # DEBUG, INFO, WARNING, ERROR
 
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -943,9 +945,13 @@ class CalendarSync:
                     except Exception:
                         heartbeat_due = True
                 if heartbeat_due:
-                    logger.info("Sending heartbeat notification (no changes, interval elapsed)")
-                    self.send_notification("Calendar Sync", f"Heartbeat: sync is running normally, no changes in the last {HEARTBEAT_INTERVAL // 3600}h")
-                    self.save_state()
+                    current_hour = datetime.now().hour
+                    if HEARTBEAT_DAY_START <= current_hour < HEARTBEAT_DAY_END:
+                        logger.info("Sending heartbeat notification (no changes, interval elapsed)")
+                        self.send_notification("Calendar Sync", f"Heartbeat: sync is running normally, no changes in the last {HEARTBEAT_INTERVAL // 3600}h")
+                        self.save_state()
+                    else:
+                        logger.debug(f"Heartbeat due but outside day hours ({HEARTBEAT_DAY_START}:00-{HEARTBEAT_DAY_END}:00), skipping")
 
             return True
 
