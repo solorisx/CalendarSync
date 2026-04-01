@@ -7,4 +7,5 @@ services:
       - ./data:/app/data
     environment:
       - SYNC_INTERVAL=${SYNC_INTERVAL:-900}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-172800}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

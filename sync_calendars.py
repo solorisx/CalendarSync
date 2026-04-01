@@ -38,6 +38,7 @@ CREDENTIALS_FILE = '/app/data/credentials.json'
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', '900'))  # 15 minutes default
+HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '172800'))  # 48 hours default
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()  # DEBUG, INFO, WARNING, ERROR
 
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -83,7 +84,7 @@ class CalendarSync:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
-        return {'last_sync': None, 'synced_events': {}, 'last_error': None}
+        return {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}
 
     def save_state(self):
         """Save sync state"""
@@ -192,12 +193,14 @@ class CalendarSync:
         notify_url = self.config.get('notify_url')
         if not notify_url:
             logger.info(f"Notification: {title} - {message}")
+            self.state['last_notification_sent'] = datetime.now().isoformat()
             return
 
         try:
             response = requests.post(notify_url, data=message.encode('utf-8'))
             if response.status_code == 200:
                 logger.info(f"Notification sent: {title}")
+                self.state['last_notification_sent'] = datetime.now().isoformat()
             else:
                 logger.warning(f"Failed to send notification (HTTP {response.status_code}): {title}")
         except Exception as e:
@@ -926,6 +929,23 @@ class CalendarSync:
 
                 notification_message = "\n".join(notification_parts)
                 self.send_notification("Calendar Sync", notification_message)
+            else:
+                # No changes — check if heartbeat notification is due
+                last_notified = self.state.get('last_notification_sent')
+                heartbeat_due = True
+                if last_notified:
+                    try:
+                        last_dt = datetime.fromisoformat(last_notified)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        seconds_since = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                        heartbeat_due = seconds_since >= HEARTBEAT_INTERVAL
+                    except Exception:
+                        heartbeat_due = True
+                if heartbeat_due:
+                    logger.info("Sending heartbeat notification (no changes, interval elapsed)")
+                    self.send_notification("Calendar Sync", f"Heartbeat: sync is running normally, no changes in the last {HEARTBEAT_INTERVAL // 3600}h")
+                    self.save_state()
 
             return True
 
