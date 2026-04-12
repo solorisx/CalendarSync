@@ -15,6 +15,7 @@ Or locally (with venv activated):
     python reconcile.py
 """
 
+import argparse
 import os
 import sys
 import json
@@ -190,13 +191,26 @@ def fetch_icloud_events(icloud_calendar, start, end):
 # ---------------------------------------------------------------------------
 
 def normalise_dt(dt_val):
-    """Return an ISO string for comparison, stripping timezone for date-only values."""
+    """Return an ISO string for comparison.
+
+    Converts tz-aware datetimes to UTC so that e.g. 19:00+02:00 and 17:00+00:00
+    compare as equal (both are 17:00 UTC).
+
+    Naive datetimes at midnight are treated as date-only (iCloud sometimes
+    returns all-day events as datetime(Y,M,D,0,0,0) instead of date(Y,M,D)).
+
+    Naive datetimes with a non-midnight time are left as-is (no tz info to
+    convert from, so we can only compare wall-clock).
+    """
     if dt_val is None:
         return None
     if isinstance(dt_val, datetime):
-        # Normalise to UTC for comparison
         if dt_val.tzinfo is not None:
-            dt_val = dt_val.astimezone(timezone.utc)
+            # Convert to UTC, then format without offset for clean comparison
+            return dt_val.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+        # Naive datetime — treat midnight as date-only (all-day stored as datetime)
+        if dt_val.hour == 0 and dt_val.minute == 0 and dt_val.second == 0:
+            return dt_val.date().isoformat()
         return dt_val.strftime('%Y-%m-%dT%H:%M:%S')
     # date object
     return dt_val.isoformat()
@@ -204,18 +218,23 @@ def normalise_dt(dt_val):
 
 def google_event_times(g_event):
     """Return (start_str, end_str) from a Google event dict."""
-    start_raw = g_event['start'].get('dateTime', g_event['start'].get('date', ''))
-    end_raw = g_event['end'].get('dateTime', g_event['end'].get('date', ''))
-    # Strip timezone for comparison (Google uses offset strings like +02:00)
-    try:
-        start = normalise_dt(datetime.fromisoformat(start_raw.replace('Z', '+00:00')))
-    except Exception:
-        start = start_raw
-    try:
-        end = normalise_dt(datetime.fromisoformat(end_raw.replace('Z', '+00:00')))
-    except Exception:
-        end = end_raw
-    return start, end
+    # Google uses 'date' key for all-day events, 'dateTime' for timed events.
+    # Preserve date-only strings as-is so they compare correctly with iCloud date objects.
+    start_raw = g_event['start'].get('dateTime') or g_event['start'].get('date', '')
+    end_raw = g_event['end'].get('dateTime') or g_event['end'].get('date', '')
+
+    def parse(raw):
+        if not raw:
+            return raw
+        # Date-only string (no 'T') — return as-is to match iCloud date objects
+        if 'T' not in raw:
+            return raw
+        try:
+            return normalise_dt(datetime.fromisoformat(raw.replace('Z', '+00:00')))
+        except Exception:
+            return raw
+
+    return parse(start_raw), parse(end_raw)
 
 
 def icloud_event_times(component):
@@ -270,15 +289,26 @@ def reconcile():
         google_service, config['google_calendar_id'], time_min, time_max
     )
 
-    # Index by iCalUID (primary) and event ID (fallback)
-    google_by_uid = {}
+    # Index Google events by a normalised canonical UID so they match iCloud's bare UIDs.
+    # Google native events have iCalUID like "abc123@google.com"; iCloud stores them as "abc123".
+    # We use the bare UID as the canonical key and keep a separate alias map for lookups.
+    google_by_uid = {}       # canonical UID → event
+    google_uid_aliases = {}  # raw iCalUID → canonical UID (for reporting the original UID)
+
+    def canonical_uid(uid):
+        uid = uid.lstrip('_')
+        if '@google.com' in uid:
+            uid = uid.split('@google.com')[0]
+        return uid
+
     for ev in google_events_list:
-        ical_uid = ev.get('iCalUID', ev['id'])
-        google_by_uid[ical_uid] = ev
-        stripped = ical_uid.lstrip('_')
-        if stripped != ical_uid:
-            google_by_uid[stripped] = ev
-    logger.info(f"Google: {len(google_events_list)} events ({len(google_by_uid)} unique UIDs)")
+        raw_uid = ev.get('iCalUID', ev['id'])
+        canon = canonical_uid(raw_uid)
+        google_by_uid[canon] = ev
+        google_uid_aliases[raw_uid] = canon
+        logger.debug(f"  Google event: {ev.get('summary', 'No Title')!r}  iCalUID={raw_uid}  canonical={canon}")
+
+    logger.info(f"Google: {len(google_events_list)} events ({len(google_by_uid)} unique UIDs after normalisation)")
 
     # --- Fetch iCloud events ---
     logger.info("Fetching iCloud Calendar events...")
@@ -287,7 +317,7 @@ def reconcile():
 
     icloud_by_uid = {}
     for event_id, component in icloud_events_list:
-        icloud_by_uid[event_id] = component
+        icloud_by_uid[canonical_uid(event_id)] = component
     logger.info(f"iCloud: {len(icloud_events_list)} events ({len(icloud_by_uid)} unique UIDs)")
 
     # ---------------------------------------------------------------------------
@@ -348,10 +378,20 @@ def reconcile():
     logger.info(f"\n[MISMATCH] In both but content differs: {len(in_both_mismatch)}")
     for uid, g_ev, i_comp, mismatches in in_both_mismatch:
         g_title = g_ev.get('summary', 'No Title')
-        g_start, _ = google_event_times(g_ev)
-        logger.warning(f"  ~ {g_title!r}  start={g_start}  (UID: {uid[:40]}...)")
+        g_start, g_end = google_event_times(g_ev)
+        i_start, i_end = icloud_event_times(i_comp)
+        i_title = str(i_comp.get('summary', 'No Title'))
+        i_desc = str(i_comp.get('description', '')) or ''
+        g_desc = g_ev.get('description', '') or ''
+        logger.warning(f"  ~ {g_title!r}  (UID: {uid[:40]}...)")
         for m in mismatches:
-            logger.warning(f"      {m}")
+            logger.warning(f"      DIFF  {m}")
+        g_start_raw = g_ev['start'].get('dateTime') or g_ev['start'].get('date', '')
+        g_end_raw = g_ev['end'].get('dateTime') or g_ev['end'].get('date', '')
+        i_start_raw = str(i_comp.get('dtstart').dt) if i_comp.get('dtstart') else ''
+        i_end_raw = str(i_comp.get('dtend').dt) if i_comp.get('dtend') else ''
+        logger.debug(f"      Google  title={g_title!r}  start={g_start}(raw:{g_start_raw})  end={g_end}(raw:{g_end_raw})  desc={g_desc[:80]!r}")
+        logger.debug(f"      iCloud  title={i_title!r}  start={i_start}(raw:{i_start_raw})  end={i_end}(raw:{i_end_raw})  desc={i_desc[:80]!r}")
         state_entry = synced_events.get(uid)
         if state_entry:
             logger.debug(f"      sync_state: source={state_entry.get('source')} "
@@ -387,18 +427,6 @@ def reconcile():
         logger.debug(f"      UID: {uid}")
         logger.debug(f"      sync_state: {state_info}")
 
-    # --- Sync state orphans (in state but not in either calendar within window) ---
-    state_orphans = []
-    for uid, entry in synced_events.items():
-        if uid not in google_by_uid and uid not in icloud_by_uid:
-            state_orphans.append((uid, entry))
-
-    logger.info(f"\n[STATE ORPHANS] In sync state but absent from both calendars (within window): {len(state_orphans)}")
-    for uid, entry in state_orphans:
-        logger.debug(f"  ? {entry.get('title', 'No Title')!r}  "
-                     f"start={entry.get('start')}  source={entry.get('source')}  "
-                     f"synced_at={entry.get('synced_at')}")
-
     # --- Summary ---
     logger.info("\n" + "=" * 60)
     logger.info("SUMMARY")
@@ -406,9 +434,142 @@ def reconcile():
     logger.info(f"  Mismatched:      {len(in_both_mismatch)}")
     logger.info(f"  Google only:     {len(only_in_google)}")
     logger.info(f"  iCloud only:     {len(only_in_icloud)}")
-    logger.info(f"  State orphans:   {len(state_orphans)}")
     logger.info("=" * 60)
+
+    return {
+        'only_in_google': only_in_google,
+        'only_in_icloud': only_in_icloud,
+        'in_both_match': in_both_match,
+        'in_both_mismatch': in_both_mismatch,
+        'google_by_uid': google_by_uid,
+        'icloud_by_uid': icloud_by_uid,
+        'synced_events': synced_events,
+        'state': state,
+    }
+
+
+def resync_orphans(results):
+    """Interactively offer to remove iCloud-only events from sync state so the
+    next sync will re-push them to Google, or remove Google-only events from
+    sync state so they get re-evaluated.
+
+    'Orphan' here means: present in one calendar but absent from the other,
+    AND already recorded in sync state (so the sync won't touch them again).
+    Removing the state entry forces the next sync to treat the event as new.
+    """
+    state = results['state']
+    synced_events = results['synced_events']
+    google_by_uid = results['google_by_uid']
+    icloud_by_uid = results['icloud_by_uid']
+
+    # iCloud-only events that are in sync state — removing the state entry will
+    # cause sync_icloud_to_google to push them to Google again.
+    icloud_orphans = [
+        uid for uid in results['only_in_icloud']
+        if uid in synced_events
+    ]
+
+    # Google-only events that are in sync state — removing the state entry will
+    # cause sync_google_to_icloud to push them to iCloud again.
+    google_orphans = [
+        uid for uid in results['only_in_google']
+        if uid in synced_events
+    ]
+
+    candidates = []
+    for uid in icloud_orphans:
+        entry = synced_events[uid]
+        i_comp = icloud_by_uid[uid]
+        i_start, _ = icloud_event_times(i_comp)
+        candidates.append((uid, entry, 'icloud-only (missing from Google)', i_start))
+
+    for uid in google_orphans:
+        entry = synced_events[uid]
+        g_ev = google_by_uid[uid]
+        g_start, _ = google_event_times(g_ev)
+        candidates.append((uid, entry, 'google-only (missing from iCloud)', g_start))
+
+    if not candidates:
+        logger.info("No orphans with sync state entries found — nothing to resync.")
+        return
+
+    print(f"\nFound {len(candidates)} event(s) in sync state that are missing from one calendar.")
+    print("Removing an entry from sync state will cause the next sync to re-push it.\n")
+
+    to_remove = []
+    for uid, entry, reason, start in candidates:
+        title = entry.get('title', 'No Title')
+        source = entry.get('source', '?')
+        synced_at = entry.get('synced_at', '?')
+        print(f"  {title!r}  start={start}  [{reason}]")
+        print(f"    state: source={source}  synced_at={synced_at}")
+        print(f"    UID: {uid}")
+        answer = input("  Remove from sync state? [y/N] ").strip().lower()
+        if answer == 'y':
+            to_remove.append(uid)
+        print()
+
+    if not to_remove:
+        logger.info("No entries removed.")
+        return
+
+    for uid in to_remove:
+        title = synced_events[uid].get('title', uid)
+        del state['synced_events'][uid]
+        logger.info(f"Removed from sync state: {title!r} ({uid})")
+
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=2)
+    logger.info(f"Saved updated sync state ({len(to_remove)} entr{'y' if len(to_remove) == 1 else 'ies'} removed).")
+    logger.info("Run a sync now to re-push these events.")
+
+
+def run_sync():
+    """Trigger an immediate sync by importing and calling CalendarSync."""
+    logger.info("Running sync...")
+    sys.path.insert(0, '/app')
+    try:
+        from sync_calendars import CalendarSync
+    except ImportError:
+        # Running locally — try current directory
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from sync_calendars import CalendarSync
+
+    sync = CalendarSync()
+    success = sync.run_sync()
+    if success:
+        logger.info("Sync completed successfully.")
+    else:
+        logger.error("Sync failed.")
+    return success
 
 
 if __name__ == '__main__':
-    reconcile()
+    parser = argparse.ArgumentParser(
+        description='Calendar reconciliation and sync tool.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python reconcile.py                   # reconcile only
+  python reconcile.py --sync            # sync, then reconcile
+  python reconcile.py --resync-orphans  # reconcile, then interactively fix orphans
+  python reconcile.py --sync --resync-orphans  # sync, reconcile, fix orphans
+        """,
+    )
+    parser.add_argument('--sync', action='store_true',
+                        help='Run a sync before reconciling')
+    parser.add_argument('--resync-orphans', action='store_true',
+                        help='Interactively remove orphaned sync state entries so the next sync re-pushes them')
+    args = parser.parse_args()
+
+    if args.sync:
+        ok = run_sync()
+        if not ok:
+            sys.exit(1)
+        print()
+
+    results = reconcile()
+
+    if args.resync_orphans:
+        print()
+        resync_orphans(results)

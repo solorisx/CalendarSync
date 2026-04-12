@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY sync_calendars.py .
 COPY sync_once.py .
+COPY reconcile.py .
 
 # Create volume mount points
 VOLUME ["/app/data"]

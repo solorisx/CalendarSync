@@ -41,6 +41,7 @@ SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', '900'))  # 15 minutes default
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '172800'))  # 48 hours default
 HEARTBEAT_DAY_START = int(os.getenv('HEARTBEAT_DAY_START', '8'))   # hour (0-23), inclusive
 HEARTBEAT_DAY_END = int(os.getenv('HEARTBEAT_DAY_END', '22'))       # hour (0-23), exclusive
+RECONCILE_HOUR = int(os.getenv('RECONCILE_HOUR', '14'))  # hour of day to run daily reconcile
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()  # DEBUG, INFO, WARNING, ERROR
 
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -634,6 +635,11 @@ class CalendarSync:
                 stripped_uid = event_uid.lstrip('_')
                 if stripped_uid != event_uid:
                     existing_google_events[stripped_uid] = g_event
+                # Native Google events have iCalUID like "abc123@google.com" but iCloud stores
+                # them with the bare UID "abc123" — index by both to avoid re-syncing.
+                if '@google.com' in event_uid:
+                    bare_uid = event_uid.split('@google.com')[0]
+                    existing_google_events[bare_uid] = g_event
         except Exception as e:
             logger.warning(f"Could not fetch existing Google events: {e}")
 
@@ -776,7 +782,30 @@ class CalendarSync:
                         from googleapiclient.errors import HttpError as _HttpError
                         if isinstance(e, _HttpError) and e.resp.status == 409:
                             logger.warning(f"Event already exists in Google (409), attempting update: {event_title}")
-                            g_event = existing_google_events.get(event_id)
+                            logger.debug(f"409 lookup: event_id={event_id!r}")
+                            # Try exact UID, then stripped variants
+                            g_event = (
+                                existing_google_events.get(event_id)
+                                or existing_google_events.get(event_id.lstrip('_'))
+                                or existing_google_events.get(event_id.split('@google.com')[0])
+                            )
+                            if g_event is None:
+                                # Last resort: fetch the event directly from Google by iCalUID
+                                logger.debug(f"Not in local cache, fetching from Google by iCalUID: {event_id}")
+                                try:
+                                    result = google_service.events().list(
+                                        calendarId=self.config['google_calendar_id'],
+                                        iCalUID=event_id,
+                                        singleEvents=True,
+                                    ).execute()
+                                    items = result.get('items', [])
+                                    if items:
+                                        g_event = items[0]
+                                        logger.debug(f"Found via iCalUID lookup: id={g_event['id']} iCalUID={g_event.get('iCalUID')}")
+                                    else:
+                                        logger.debug(f"iCalUID lookup returned no results for {event_id!r}")
+                                except Exception as lookup_err:
+                                    logger.error(f"iCalUID lookup failed: {lookup_err}")
                             if g_event:
                                 try:
                                     patch_body = {
@@ -791,11 +820,12 @@ class CalendarSync:
                                         eventId=g_event['id'],
                                         body=patch_body
                                     ).execute())
+                                    updated_count += 1
                                     logger.info(f"Updated existing Google event: {event_title}")
                                 except Exception as patch_err:
                                     logger.error(f"Failed to update existing Google event '{event_title}': {patch_err}")
                             else:
-                                logger.debug(f"409 but event not found in existing_google_events, recording as synced: {event_title}")
+                                logger.warning(f"409 but could not locate event in Google even by iCalUID lookup: {event_title} ({event_id})")
                             self._record_synced_event(
                                 event_id, event_title, source='icloud',
                                 start=event_start, last_modified=last_modified
@@ -885,6 +915,68 @@ class CalendarSync:
             'deleted_events': deleted_events,
             'errors': error_count
         }
+
+    def run_reconcile(self):
+        """Run a reconciliation check and send a summary notification."""
+        logger.info("Running daily reconciliation check...")
+        try:
+            # Import reconcile lazily to avoid circular deps and keep it optional
+            import importlib.util, pathlib
+            spec = importlib.util.spec_from_file_location(
+                "reconcile",
+                pathlib.Path(__file__).parent / "reconcile.py"
+            )
+            reconcile_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(reconcile_mod)
+
+            results = reconcile_mod.reconcile()
+
+            matching = len(results['in_both_match']) if 'in_both_match' in results else 0
+            mismatched = len(results['in_both_mismatch'])
+            google_only = len(results['only_in_google'])
+            icloud_only = len(results['only_in_icloud'])
+
+            lines = [f"Daily reconcile: {matching} matching, {mismatched} mismatched, {google_only} Google-only, {icloud_only} iCloud-only"]
+
+            if mismatched:
+                lines.append(f"Mismatches ({mismatched}):")
+                for uid, g_ev, i_comp, diffs in results['in_both_mismatch'][:5]:
+                    title = g_ev.get('summary', 'No Title')
+                    lines.append(f"  ~ {title}: {'; '.join(diffs)}")
+                if mismatched > 5:
+                    lines.append(f"  ... and {mismatched - 5} more")
+
+            if google_only:
+                lines.append(f"Google-only ({google_only}):")
+                for uid in results['only_in_google'][:5]:
+                    g_ev = results['google_by_uid'][uid]
+                    start = g_ev['start'].get('dateTime', g_ev['start'].get('date', ''))[:10]
+                    lines.append(f"  → {g_ev.get('summary', 'No Title')} ({start})")
+                if google_only > 5:
+                    lines.append(f"  ... and {google_only - 5} more")
+
+            if icloud_only:
+                lines.append(f"iCloud-only ({icloud_only}):")
+                for uid in results['only_in_icloud'][:5]:
+                    i_comp = results['icloud_by_uid'][uid]
+                    i_start, _ = reconcile_mod.icloud_event_times(i_comp)
+                    start = (i_start or '')[:10]
+                    lines.append(f"  ← {i_comp.get('summary', 'No Title')} ({start})")
+                if icloud_only > 5:
+                    lines.append(f"  ... and {icloud_only - 5} more")
+
+            self.state['last_reconcile'] = datetime.now().isoformat()
+            self.save_state()
+
+            if mismatched or google_only or icloud_only:
+                self.send_notification("Calendar Reconcile", "\n".join(lines))
+            else:
+                logger.info("Reconcile: all calendars in sync, no notification sent")
+
+        except Exception as e:
+            logger.error(f"Reconcile failed: {e}")
+            logger.debug("Full traceback:", exc_info=True)
+            self.send_notification("Calendar Reconcile Error", f"Reconcile failed: {e}")
 
     def run_sync(self):
         """Execute bidirectional sync"""
@@ -1042,11 +1134,30 @@ def main():
     """Main loop with scheduled syncing"""
     logger.info("Calendar Sync Service Starting...")
     logger.info(f"Sync interval: {SYNC_INTERVAL} seconds (log level: {LOG_LEVEL})")
+    logger.info(f"Daily reconcile scheduled at {RECONCILE_HOUR:02d}:00")
 
     sync = CalendarSync()
 
     while True:
         sync.run_sync()
+
+        # Run daily reconcile once per day at RECONCILE_HOUR
+        now = datetime.now()
+        last_reconcile_str = sync.state.get('last_reconcile')
+        run_reconcile = False
+        if now.hour == RECONCILE_HOUR:
+            if last_reconcile_str:
+                try:
+                    last_reconcile = datetime.fromisoformat(last_reconcile_str)
+                    if (now - last_reconcile).total_seconds() > 3600:
+                        run_reconcile = True
+                except Exception:
+                    run_reconcile = True
+            else:
+                run_reconcile = True
+        if run_reconcile:
+            sync.run_reconcile()
+
         logger.info(f"Next sync in {SYNC_INTERVAL} seconds...")
         time.sleep(SYNC_INTERVAL)
 
