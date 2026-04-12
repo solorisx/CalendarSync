@@ -414,7 +414,7 @@ class CalendarSync:
                 event_start = event['start'].get('dateTime', event['start'].get('date'))
                 self._record_synced_event(
                     event_uid, event.get('summary'),
-                    source='icloud' if event.get('iCalUID') else 'google',
+                    source='google',
                     start=event_start
                 )
                 logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
@@ -770,7 +770,27 @@ class CalendarSync:
                     except Exception as e:
                         from googleapiclient.errors import HttpError as _HttpError
                         if isinstance(e, _HttpError) and e.resp.status == 409:
-                            logger.warning(f"Event already exists in Google (409), recording as synced to prevent retry: {event_title}")
+                            logger.warning(f"Event already exists in Google (409), attempting update: {event_title}")
+                            g_event = existing_google_events.get(event_id)
+                            if g_event:
+                                try:
+                                    patch_body = {
+                                        'summary': google_event['summary'],
+                                        'start': start_dict,
+                                        'end': end_dict,
+                                    }
+                                    if google_event.get('description'):
+                                        patch_body['description'] = google_event['description']
+                                    retry(lambda: google_service.events().patch(
+                                        calendarId=self.config['google_calendar_id'],
+                                        eventId=g_event['id'],
+                                        body=patch_body
+                                    ).execute())
+                                    logger.info(f"Updated existing Google event: {event_title}")
+                                except Exception as patch_err:
+                                    logger.error(f"Failed to update existing Google event '{event_title}': {patch_err}")
+                            else:
+                                logger.debug(f"409 but event not found in existing_google_events, recording as synced: {event_title}")
                             self._record_synced_event(
                                 event_id, event_title, source='icloud',
                                 start=event_start, last_modified=last_modified
