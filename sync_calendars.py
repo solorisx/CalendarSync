@@ -968,8 +968,11 @@ class CalendarSync:
             self.state['last_reconcile'] = datetime.now().isoformat()
             self.save_state()
 
+            notification_text = "Calendar Reconcile", "\n".join(lines)
+            logger.debug("Reconcile results:\n" + "\n".join(lines))
+
             if mismatched or google_only or icloud_only:
-                self.send_notification("Calendar Reconcile", "\n".join(lines))
+                self.send_notification("Calendar Reconcile", notification_text)
             else:
                 logger.info("Reconcile: all calendars in sync, no notification sent")
 
