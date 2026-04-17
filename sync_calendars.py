@@ -11,6 +11,7 @@ import pickle
 import requests
 import time
 import logging
+import hashlib
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from icalendar import Calendar, Event, Alarm
@@ -126,18 +127,29 @@ class CalendarSync:
         if to_remove:
             logger.debug(f"Removed {len(to_remove)} past event(s) from sync state")
 
-    def _record_synced_event(self, event_id, title, source, start, last_modified=None, failed=False, error=None):
+    def _record_synced_event(self, event_id, title, source, start, last_modified=None, failed=False, error=None, icloud_uid=None, last_modified_google=None, last_modified_icloud=None):
         """Record a synced event in the state"""
+        existing = self.state['synced_events'].get(event_id, {})
         entry = {
             'title': title,
             'synced_at': datetime.now().isoformat(),
             'source': source,
             'start': start,
             'last_modified': last_modified,
+            # Store per-source timestamps to avoid update ping-pong.
+            # Each sync direction compares against its own source timestamp only.
+            'last_modified_google': last_modified_google or existing.get('last_modified_google'),
+            'last_modified_icloud': last_modified_icloud or existing.get('last_modified_icloud'),
         }
         if failed:
             entry['sync_failed'] = True
             entry['error'] = error
+        if icloud_uid and icloud_uid != event_id:
+            # Track the UID actually written to iCloud (may be hashed) so the
+            # iCloud→Google direction can recognise the event and skip it.
+            entry['icloud_uid'] = icloud_uid
+        elif existing.get('icloud_uid'):
+            entry['icloud_uid'] = existing['icloud_uid']
         self.state['synced_events'][event_id] = entry
 
     def cleanup_google_orphans(self, dry_run=True):
@@ -313,6 +325,23 @@ class CalendarSync:
         updated_events = []
         deleted_events = []
 
+        # Deduplicate recurring event instances by iCalUID — singleEvents=True expands
+        # each occurrence of a recurring series into its own event with a unique composite ID.
+        # We only want to sync one representative instance per series (the first one returned,
+        # which is the earliest upcoming occurrence) to avoid flooding iCloud with duplicates.
+        seen_ical_uids = set()
+        deduped_events = []
+        for event in events:
+            ical_uid = event.get('iCalUID', event['id'])
+            if ical_uid in seen_ical_uids:
+                logger.debug(f"  Skipping duplicate recurring instance: {event.get('summary')} (iCalUID: {ical_uid})")
+                continue
+            seen_ical_uids.add(ical_uid)
+            deduped_events.append(event)
+        if len(deduped_events) < len(events):
+            logger.debug(f"Deduplicated {len(events)} events to {len(deduped_events)} (removed {len(events) - len(deduped_events)} recurring instances)")
+        events = deduped_events
+
         # Track current Google event UIDs (use plain event ID, not iCalUID)
         # We use event['id'] to match what we store in sync_state
         current_google_ids = {event['id'] for event in events}
@@ -353,8 +382,12 @@ class CalendarSync:
         for event in events:
             event_uid = event['id']
             event_title = event.get('summary', 'No Title')
-            # iCloud rejects UIDs starting with '_' (Google-internal format); strip them
+            # iCloud rejects UIDs starting with '_' (Google-internal format); strip them.
+            # iCloud also rejects UIDs longer than ~255 chars; hash excessively long UIDs.
             safe_uid = event_uid.lstrip('_')
+            if len(safe_uid) > 200:
+                safe_uid = hashlib.sha256(safe_uid.encode()).hexdigest()
+                logger.debug(f"UID too long, hashed to: {safe_uid}")
             logger.debug(f"Checking event: {event_title} (ID: {event_uid}, iCalUID: {event.get('iCalUID')})")
 
             # Check if event originated from iCloud by looking it up in sync state.
@@ -368,13 +401,14 @@ class CalendarSync:
                 logger.debug(f"  Skipping: Event originated from iCloud (found in sync state as icloud source)")
                 continue
 
-            if event_uid in self.state['synced_events'] and self.state['synced_events'][event_uid].get('sync_failed') == 'true':
-                # Check if the event has been modified since last sync
-                last_modified = event.get('updated')  # Google uses RFC3339 'updated' field
-                stored_modified = self.state['synced_events'][event_uid].get('last_modified') or self.state['synced_events'][event_uid].get('synced_at')
+            if event_uid in self.state['synced_events'] and not self.state['synced_events'][event_uid].get('sync_failed'):
+                # Event already successfully synced — skip unless Google's timestamp changed
+                last_modified = event.get('updated')
+                stored_state = self.state['synced_events'][event_uid]
+                stored_modified = stored_state.get('last_modified_google') or stored_state.get('last_modified') or stored_state.get('synced_at')
                 logger.debug(f"  Event already synced. Checking for modifications...")
                 logger.debug(f"    Last modified in Google: {last_modified}")
-                logger.debug(f"    Last modified in state: {stored_modified}")
+                logger.debug(f"    Last modified in state (google): {stored_modified}")
                 if last_modified and stored_modified and last_modified != stored_modified:
                     logger.debug(f"  Event modified: {event_title} (was: {stored_modified}, now: {last_modified})")
                     # Update the existing iCloud event
@@ -402,6 +436,7 @@ class CalendarSync:
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
+                            self.state['synced_events'][event_uid]['last_modified_google'] = last_modified
                             self.state['synced_events'][event_uid]['last_modified'] = last_modified
                             self.state['synced_events'][event_uid]['title'] = event.get('summary')
                             updated_count += 1
@@ -421,7 +456,9 @@ class CalendarSync:
                 self._record_synced_event(
                     event_uid, event.get('summary'),
                     source='google',
-                    start=event_start
+                    start=event_start,
+                    icloud_uid=safe_uid,
+                    last_modified_google=event.get('updated')
                 )
                 logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
                 continue
@@ -465,7 +502,8 @@ class CalendarSync:
                 retry(lambda: icloud_calendar.save_event(ical_data))
                 self._record_synced_event(
                     event_uid, event.get('summary'), source='google',
-                    start=event_start, last_modified=event.get('updated')
+                    start=event_start, last_modified=event.get('updated'),
+                    icloud_uid=safe_uid, last_modified_google=event.get('updated')
                 )
                 synced_count += 1
                 added_events.append({
@@ -599,6 +637,14 @@ class CalendarSync:
         # Track current iCloud event UIDs
         current_icloud_ids = set()
 
+        # Build an index of iCloud UIDs that were written by us from Google-origin events
+        # (including hashed UIDs). Used to prevent iCloud→Google ping-pong.
+        google_origin_icloud_uids = {
+            entry['icloud_uid']
+            for entry in self.state['synced_events'].values()
+            if entry.get('source') == 'google' and entry.get('icloud_uid')
+        }
+
         # Get existing Google events to check for duplicates
         existing_google_events = {}
         try:
@@ -671,8 +717,9 @@ class CalendarSync:
                     last_modified = last_modified_prop.dt.isoformat() if last_modified_prop and hasattr(last_modified_prop.dt, 'isoformat') else None
 
                     if event_id in self.state['synced_events']:
-                        # Check if modified since last sync
-                        stored_modified = self.state['synced_events'][event_id].get('last_modified') or self.state['synced_events'][event_id].get('synced_at')
+                        # Check if modified since last sync — compare against iCloud timestamp only
+                        stored_state = self.state['synced_events'][event_id]
+                        stored_modified = stored_state.get('last_modified_icloud') or stored_state.get('last_modified') or stored_state.get('synced_at')
                         if last_modified and stored_modified and last_modified != stored_modified:
                             event_title = str(component.get('summary', 'No Title')) + (" (recurring)" if recurrence_id else "")
                             logger.debug(f"  Event modified: {event_title} (was: {stored_modified}, now: {last_modified})")
@@ -700,6 +747,7 @@ class CalendarSync:
                                         eventId=g_event['id'],
                                         body=patch_body
                                     ).execute()
+                                    self.state['synced_events'][event_id]['last_modified_icloud'] = last_modified
                                     self.state['synced_events'][event_id]['last_modified'] = last_modified
                                     self.state['synced_events'][event_id]['title'] = event_title
                                     updated_count += 1
@@ -712,6 +760,14 @@ class CalendarSync:
                             logger.debug(f"  Skipping: Already in sync state (not modified)")
                         continue
 
+                    # Check if this iCloud UID is the hashed form of a Google-origin event.
+                    # When a Google event has a very long UID, we hash it before writing to iCloud.
+                    # The iCloud→Google direction sees the hashed UID and wouldn't find it in
+                    # existing_google_events, causing it to add the event back to Google as new.
+                    if event_id in google_origin_icloud_uids:
+                        logger.debug(f"  Skipping: iCloud event with hashed UID originated from Google: {component.get('summary')}")
+                        continue
+
                     # Check if event already exists in Google (by UID)
                     if event_id in existing_google_events:
                         # Event already exists in Google, just record it in state
@@ -720,7 +776,8 @@ class CalendarSync:
                         self._record_synced_event(
                             event_id,
                             str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
-                            source='icloud', start=event_start, last_modified=last_modified
+                            source='icloud', start=event_start, last_modified=last_modified,
+                            last_modified_icloud=last_modified
                         )
                         logger.debug(f"Skipped (already exists in Google): {component.get('summary')}")
                         continue
@@ -770,7 +827,8 @@ class CalendarSync:
 
                         self._record_synced_event(
                             event_id, event_title, source='icloud',
-                            start=event_start, last_modified=last_modified
+                            start=event_start, last_modified=last_modified,
+                            last_modified_icloud=last_modified
                         )
                         synced_count += 1 if not recurrence_id else 0  # Count only master events
                         added_events.append({

@@ -193,23 +193,22 @@ def fetch_icloud_events(icloud_calendar, start, end):
 def normalise_dt(dt_val):
     """Return an ISO string for comparison.
 
-    Converts tz-aware datetimes to UTC so that e.g. 19:00+02:00 and 17:00+00:00
-    compare as equal (both are 17:00 UTC).
+    Uses wall-clock time (stripping timezone info) so that Google's tz-aware
+    times (e.g. 19:00+02:00) and iCloud's naive times (e.g. 19:00:00, which
+    the sync wrote as UTC but iCloud returns without tz) compare as equal when
+    the wall-clock hour matches.
 
     Naive datetimes at midnight are treated as date-only (iCloud sometimes
     returns all-day events as datetime(Y,M,D,0,0,0) instead of date(Y,M,D)).
-
-    Naive datetimes with a non-midnight time are left as-is (no tz info to
-    convert from, so we can only compare wall-clock).
     """
     if dt_val is None:
         return None
     if isinstance(dt_val, datetime):
-        if dt_val.tzinfo is not None:
-            # Convert to UTC, then format without offset for clean comparison
-            return dt_val.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-        # Naive datetime — treat midnight as date-only (all-day stored as datetime)
+        # Strip timezone — compare wall-clock hours only.
+        # Both Google (tz-aware) and iCloud (naive, stored as UTC by sync but
+        # returned without tz) will show the same local/display time this way.
         if dt_val.hour == 0 and dt_val.minute == 0 and dt_val.second == 0:
+            # Treat midnight as date-only (handles all-day events stored as datetime)
             return dt_val.date().isoformat()
         return dt_val.strftime('%Y-%m-%dT%H:%M:%S')
     # date object
