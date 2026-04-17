@@ -742,13 +742,14 @@ class CalendarSync:
                                     }
                                     if component.get('description'):
                                         patch_body['description'] = str(component.get('description'))
-                                    google_service.events().patch(
+                                    updated_g_event = google_service.events().patch(
                                         calendarId=self.config['google_calendar_id'],
                                         eventId=g_event['id'],
                                         body=patch_body
                                     ).execute()
                                     self.state['synced_events'][event_id]['last_modified_icloud'] = last_modified
                                     self.state['synced_events'][event_id]['last_modified'] = last_modified
+                                    self.state['synced_events'][event_id]['last_modified_google'] = updated_g_event.get('updated')
                                     self.state['synced_events'][event_id]['title'] = event_title
                                     updated_count += 1
                                     event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
