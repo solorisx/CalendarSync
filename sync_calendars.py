@@ -671,7 +671,12 @@ class CalendarSync:
         # Delete events from iCloud that were deleted from Google
         logger.debug(f"Events to delete from iCloud: {len(events_to_delete)}")
         for event_id in events_to_delete:
-            logger.debug(f"Attempting to delete event from iCloud: {event_id}")
+            event_info = self.state['synced_events'][event_id]
+            # Match on the UID we actually WROTE to iCloud (stored as icloud_uid — it may
+            # have been '_'-stripped or SHA-256 hashed for long ids). Reconstructing it from
+            # the Google id failed for hashed UIDs, orphaning the iCloud event.
+            target_uid = event_info.get('icloud_uid') or event_id.lstrip('_')
+            logger.debug(f"Attempting to delete event from iCloud: {event_id} (uid={target_uid})")
             try:
                 # Find and delete the event in iCloud by UID
                 with SuppressCaldavOutput():
@@ -695,13 +700,11 @@ class CalendarSync:
                                     full_uid = f"{icloud_uid}_{recurrence_str}"
                                 else:
                                     full_uid = icloud_uid
-                                safe_event_id = event_id.lstrip('_')
-                                logger.debug(f"    Comparing: iCloud UID={full_uid} vs target={safe_event_id}")
-                                if full_uid == safe_event_id or icloud_uid == safe_event_id:
+                                logger.debug(f"    Comparing: iCloud UID={full_uid} vs target={target_uid}")
+                                if full_uid == target_uid or icloud_uid == target_uid:
                                     logger.debug(f"    → Match found! Deleting...")
                                     icloud_event.delete()
                                     deleted_count += 1
-                                    event_info = self.state['synced_events'][event_id]
                                     deleted_events.append({
                                         'title': event_info['title'],
                                         'start': event_info.get('start', 'unknown')

@@ -326,6 +326,29 @@ def test_all_day_event_stays_all_day():
     assert dtstart == _date(2026, 12, 25)
 
 
+def test_hashed_uid_event_deletes_from_icloud():
+    """A Google event whose UID is hashed (len > 200) must be deletable from iCloud:
+    the delete loop must match on the stored (hashed) icloud_uid, not the Google id."""
+    import hashlib
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    long_id = "g" * 250
+    start = _dt.now(_tz.utc) + _td(days=2)  # in-window relative to real now
+    g = {long_id: {"id": long_id, "iCalUID": long_id + "@google.com", "summary": "Long",
+                   "start": {"dateTime": start.isoformat().replace("+00:00", "Z")},
+                   "end": {"dateTime": (start + _td(hours=1)).isoformat().replace("+00:00", "Z")},
+                   "updated": tick_iso()}}
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    expected_uid = hashlib.sha256(long_id.encode()).hexdigest()
+    assert expected_uid in ic.store, "event should be created in iCloud under the hashed uid"
+    assert s.state["synced_events"][long_id].get("icloud_uid") == expected_uid
+    del g[long_id]  # user deletes it in Google
+    gr, ir = cycle(s)
+    assert expected_uid not in ic.store, "hashed-uid event must be deleted, not orphaned"
+    assert long_id not in s.state["synced_events"]
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
