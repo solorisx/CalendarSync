@@ -223,6 +223,47 @@ def test_cleanup_keeps_events_inside_window():
     assert "old" not in s.state["synced_events"], "must drop event well past window"
 
 
+def test_state_atomic_save_and_load_roundtrip():
+    import tempfile
+    sf = os.path.join(tempfile.mkdtemp(), "sync_state.json")
+    old = sync_calendars.STATE_FILE
+    sync_calendars.STATE_FILE = sf
+    try:
+        obj = CalendarSync.__new__(CalendarSync)
+        obj.state = {"last_sync": "x", "synced_events": {"a": {"title": "t"}},
+                     "last_error": None, "last_notification_sent": None}
+        obj.save_state()
+        assert os.path.exists(sf)
+        loaded = CalendarSync.load_state(obj)
+        assert loaded["synced_events"]["a"]["title"] == "t"
+        # missing keys in an older file are backfilled
+        for k in ("last_sync", "synced_events", "last_error", "last_notification_sent"):
+            assert k in loaded
+    finally:
+        sync_calendars.STATE_FILE = old
+
+
+def test_state_recovers_from_corruption():
+    import tempfile
+    sf = os.path.join(tempfile.mkdtemp(), "sync_state.json")
+    old = sync_calendars.STATE_FILE
+    sync_calendars.STATE_FILE = sf
+    try:
+        obj = CalendarSync.__new__(CalendarSync)
+        obj.state = {"last_sync": None, "synced_events": {"good": {}},
+                     "last_error": None, "last_notification_sent": None}
+        obj.save_state()  # writes primary
+        obj.state = {"last_sync": None, "synced_events": {"good2": {}},
+                     "last_error": None, "last_notification_sent": None}
+        obj.save_state()  # rotates previous primary -> .bak
+        with open(sf, "w") as f:
+            f.write("{ this is not valid json")  # corrupt primary
+        loaded = CalendarSync.load_state(obj)
+        assert "good" in loaded["synced_events"], f"should recover from backup: {loaded}"
+    finally:
+        sync_calendars.STATE_FILE = old
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -126,15 +126,54 @@ class CalendarSync:
 
     def load_state(self):
         """Load sync state"""
+        default = {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        return {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    loaded = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                # A truncated/corrupt state file must not crash the service loop.
+                # Fall back to a backup if one exists, otherwise start clean —
+                # the next sync rebuilds state from both calendars.
+                logger.error(f"Sync state file is unreadable ({e}); attempting recovery")
+                backup = STATE_FILE + '.bak'
+                if os.path.exists(backup):
+                    try:
+                        with open(backup, 'r') as f:
+                            loaded = json.load(f)
+                        logger.warning("Recovered sync state from backup")
+                    except (json.JSONDecodeError, OSError):
+                        logger.error("Backup also unreadable; starting with empty state")
+                        loaded = dict(default)
+                else:
+                    loaded = dict(default)
+            # Ensure all expected keys are present (older state files may lack some)
+            for k, v in default.items():
+                loaded.setdefault(k, v)
+            return loaded
+        return dict(default)
 
     def save_state(self):
-        """Save sync state"""
-        with open(STATE_FILE, 'w') as f:
-            json.dump(self.state, f, indent=2)
+        """Save sync state atomically.
+
+        Writing in place risks a truncated, unparseable file if the process is
+        killed mid-write (which would then crash the next startup). Write to a
+        temp file, keep the previous good copy as a backup, then atomically
+        replace."""
+        tmp = STATE_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(self.state, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(STATE_FILE):
+                try:
+                    os.replace(STATE_FILE, STATE_FILE + '.bak')
+                except OSError:
+                    pass
+            os.replace(tmp, STATE_FILE)
+        except OSError as e:
+            logger.error(f"Failed to save sync state: {e}")
 
     def _cleanup_past_events(self):
         """Remove past events from sync state to keep it lean.
@@ -530,8 +569,8 @@ class CalendarSync:
 
             # Convert to UTC if it has timezone info, otherwise treat as-is
             if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo is not None:
-                start_dt = start_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
-                end_dt = end_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
+                start_dt = start_dt.astimezone(timezone.utc)
+                end_dt = end_dt.astimezone(timezone.utc)
 
             ical_event.add('dtstart', start_dt)
             ical_event.add('dtend', end_dt)
@@ -1093,8 +1132,8 @@ class CalendarSync:
             self.state['last_reconcile'] = datetime.now().isoformat()
             self.save_state()
 
-            notification_text = "Calendar Reconcile", "\n".join(lines)
-            logger.debug("Reconcile results:\n" + "\n".join(lines))
+            notification_text = "\n".join(lines)
+            logger.debug("Reconcile results:\n" + notification_text)
 
             if mismatched or google_only or icloud_only:
                 self.send_notification("Calendar Reconcile", notification_text)
