@@ -306,6 +306,26 @@ def test_queries_use_configured_future_horizon():
         sync_calendars.SYNC_FUTURE_DAYS = old_future
 
 
+def gevent_allday(d, summary="Holiday"):
+    return {"id": "gid_allday1", "iCalUID": "gid_allday1@google.com", "summary": summary,
+            "start": {"date": d.isoformat()},
+            "end": {"date": (d + timedelta(days=1)).isoformat()},
+            "updated": tick_iso()}
+
+
+def test_all_day_event_stays_all_day():
+    from datetime import date as _date, datetime as _dt
+    g = {"gid_allday1": gevent_allday(_date(2026, 12, 25))}
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    cal = Calendar.from_ical(ic.store["gid_allday1"])
+    dtstart = next(c.get("dtstart").dt for c in cal.walk() if c.name == "VEVENT")
+    # All-day must be a bare date, NOT a midnight datetime (the old corruption).
+    assert isinstance(dtstart, _date) and not isinstance(dtstart, _dt), f"corrupted to {dtstart!r}"
+    assert dtstart == _date(2026, 12, 25)
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

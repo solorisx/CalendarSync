@@ -13,7 +13,7 @@ import time
 import logging
 import hashlib
 from io import StringIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from icalendar import Calendar, Event, Alarm
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -149,6 +149,26 @@ class CalendarSync:
         time_min = start_dt.isoformat().replace('+00:00', 'Z')
         time_max = end_dt.isoformat().replace('+00:00', 'Z')
         return now, start_dt, end_dt, time_min, time_max
+
+    @staticmethod
+    def _google_start_end(event):
+        """Return (dtstart, dtend) for a Google event as icalendar-ready values:
+        a UTC ``datetime`` for timed events, or a ``date`` for all-day events.
+
+        Google represents all-day events with a ``date`` key (no ``dateTime``) and an
+        *exclusive* end date — which is exactly iCal's VALUE=DATE DTEND convention, so a
+        ``date`` object round-trips as an all-day VEVENT. The previous code fell back to
+        the ``date`` string and ran it through ``datetime.fromisoformat``, turning all-day
+        events into midnight-UTC *timed* events (and shifting them by timezone)."""
+        s, e = event['start'], event['end']
+        if 'dateTime' not in s and 'date' in s:
+            return date.fromisoformat(s['date']), date.fromisoformat(e['date'])
+        start_dt = datetime.fromisoformat(s['dateTime'].replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(e['dateTime'].replace('Z', '+00:00'))
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.astimezone(timezone.utc)
+            end_dt = end_dt.astimezone(timezone.utc)
+        return start_dt, end_dt
 
     def load_state(self):
         """Load sync state"""
@@ -532,14 +552,11 @@ class CalendarSync:
                                         component.add('description', event['description'])
                                     elif 'description' in component:
                                         del component['description']
-                                    start = event['start'].get('dateTime', event['start'].get('date'))
-                                    end = event['end'].get('dateTime', event['end'].get('date'))
-                                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                                    end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                                    ev_start, ev_end = self._google_start_end(event)
                                     component.pop('dtstart', None)
                                     component.pop('dtend', None)
-                                    component.add('dtstart', start_dt)
-                                    component.add('dtend', end_dt)
+                                    component.add('dtstart', ev_start)
+                                    component.add('dtend', ev_end)
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
@@ -583,20 +600,9 @@ class CalendarSync:
             if event.get('description'):
                 ical_event.add('description', event['description'])
 
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            end = event['end'].get('dateTime', event['end'].get('date'))
-
-            # Parse datetime and convert to UTC to avoid timezone issues with iCloud
-            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
-
-            # Convert to UTC if it has timezone info, otherwise treat as-is
-            if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo is not None:
-                start_dt = start_dt.astimezone(timezone.utc)
-                end_dt = end_dt.astimezone(timezone.utc)
-
-            ical_event.add('dtstart', start_dt)
-            ical_event.add('dtend', end_dt)
+            ev_start, ev_end = self._google_start_end(event)
+            ical_event.add('dtstart', ev_start)
+            ical_event.add('dtend', ev_end)
             ical_event.add('uid', safe_uid)
 
             # Add 30-minute reminder
