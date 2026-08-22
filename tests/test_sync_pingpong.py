@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+Regression tests for state-handling sync bugs (duplicate / update ping-pong).
+
+These drive the REAL CalendarSync logic through in-memory fakes for the Google
+Calendar API and the iCloud CalDAV surface. No network, no credentials.
+
+Run:  python3 tests/test_sync_pingpong.py     (plain, no pytest needed)
+      python3 -m pytest tests/test_sync_pingpong.py
+
+What they lock in:
+  * a mirrored event does NOT flap forever, regardless of whether iCloud
+    re-stamps LAST-MODIFIED on our writes (the ping-pong bug);
+  * iCloud-origin events stay stable;
+  * GENUINE edits on either side still propagate exactly once (the fix must
+    not over-suppress real changes);
+  * _cleanup_past_events never drops an event still inside the active window
+    (the re-seed-near-event-time bug).
+"""
+import os, sys, itertools
+from datetime import datetime, timezone, timedelta
+from icalendar import Calendar, Event
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sync_calendars
+from sync_calendars import CalendarSync
+import logging
+sync_calendars.logger.setLevel(logging.ERROR)
+
+_base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+_counter = itertools.count()
+def tick():     return _base + timedelta(seconds=next(_counter))
+def tick_iso(): return tick().isoformat().replace("+00:00", "Z")
+def at(sec):    return (_base + timedelta(seconds=sec)).isoformat().replace("+00:00", "Z")
+
+
+# ----------------------------- fakes ---------------------------------------
+class _Exec:
+    def __init__(self, v): self._v = v
+    def execute(self):     return self._v
+
+class FakeGoogleEvents:
+    def __init__(self, store): self.store = store
+    def list(self, calendarId=None, timeMin=None, timeMax=None, singleEvents=None,
+             orderBy=None, pageToken=None, iCalUID=None):
+        items = list(self.store.values())
+        if iCalUID is not None:
+            items = [e for e in items if e.get("iCalUID") == iCalUID]
+        return _Exec({"items": items, "nextPageToken": None})
+    def insert(self, calendarId=None, body=None):
+        gid = "gid_" + (body.get("iCalUID", "").split("@")[0] or str(next(_counter)))
+        ev = dict(body); ev["id"] = gid
+        ev["iCalUID"] = body.get("iCalUID") or (gid + "@google.com")
+        ev["updated"] = tick_iso(); self.store[gid] = ev
+        return _Exec(dict(ev))
+    def patch(self, calendarId=None, eventId=None, body=None):
+        ev = self.store[eventId]; ev.update(body); ev["updated"] = tick_iso()
+        return _Exec(dict(ev))
+    def delete(self, calendarId=None, eventId=None):
+        self.store.pop(eventId, None); return _Exec({})
+
+class FakeGoogleService:
+    def __init__(self, store): self._e = FakeGoogleEvents(store)
+    def events(self): return self._e
+
+class FakeICloudEvent:
+    def __init__(self, cal, uid, data): self._cal, self._uid, self.data = cal, uid, data
+    def save(self):   self._cal._store(self.data, bump=self._cal.bump_on_update)
+    def delete(self): self._cal.store.pop(self._uid, None)
+
+class FakeICloudCalendar:
+    name = "Home"
+    def __init__(self, bump_on_update=True, emit_last_modified=True):
+        self.store = {}
+        self.bump_on_update = bump_on_update
+        self.emit_last_modified = emit_last_modified
+    def _store(self, ical_data, bump=True):
+        cal = Calendar.from_ical(ical_data); uid = None
+        for comp in cal.walk():
+            if comp.name == "VEVENT":
+                uid = str(comp.get("uid"))
+                if self.emit_last_modified and (bump or comp.get("last-modified") is None):
+                    comp.pop("last-modified", None); comp.add("last-modified", tick())
+                elif not self.emit_last_modified:
+                    comp.pop("last-modified", None)
+                self.store[uid] = cal.to_ical()
+        return uid
+    def save_event(self, ical_data): return self._store(ical_data, bump=True)
+    def date_search(self, start=None, end=None, expand=True):
+        return [FakeICloudEvent(self, u, d) for u, d in list(self.store.items())]
+    # test helpers -----------------------------------------------------------
+    def summary_of(self, uid):
+        cal = Calendar.from_ical(self.store[uid])
+        for c in cal.walk():
+            if c.name == "VEVENT":
+                return str(c.get("summary"))
+    def user_edit(self, uid, summary):
+        cal = Calendar.from_ical(self.store[uid])
+        for c in cal.walk():
+            if c.name == "VEVENT":
+                c.pop("summary", None); c.add("summary", summary)
+                c.pop("last-modified", None); c.add("last-modified", tick())
+        self.store[uid] = cal.to_ical()
+
+class SandboxSync(CalendarSync):
+    def __init__(self, g, i):
+        self._google = FakeGoogleService(g); self._icloud = i
+        self.config = {"google_calendar_id": "primary", "icloud": {"calendar_name": "Home"}}
+        self.state = {"last_sync": None, "synced_events": {}, "last_error": None,
+                      "last_notification_sent": None}
+    def load_config(self): return self.config
+    def load_state(self):  return self.state
+    def save_state(self):  pass
+    def get_google_service(self):  return self._google
+    def get_icloud_calendar(self): return self._icloud
+    def send_notification(self, *a, **k): pass
+
+
+def gevent(start, summary="Team Meeting", updated=None):
+    return {"id": "gid_evt1abc", "iCalUID": "gid_evt1abc@google.com", "summary": summary,
+            "start": {"dateTime": start.isoformat().replace("+00:00", "Z")},
+            "end":   {"dateTime": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+            "updated": updated or tick_iso()}
+
+def icloud_ics(uid, start, summary="Dentist"):
+    cal = Calendar(); ev = Event()
+    ev.add("summary", summary); ev.add("uid", uid)
+    ev.add("dtstart", start); ev.add("dtend", start + timedelta(hours=1))
+    ev.add("last-modified", tick()); cal.add_component(ev)
+    return cal.to_ical()
+
+def cycle(sync):
+    g = sync.sync_google_to_icloud(sync._google, sync._icloud)
+    i = sync.sync_icloud_to_google(sync._google, sync._icloud)
+    return g, i
+
+START = datetime(2026, 3, 1, 10, tzinfo=timezone.utc)
+
+
+# ----------------------------- tests ---------------------------------------
+def test_no_pingpong_google_origin_bumping_server():
+    """Aggressive iCloud (re-stamps LAST-MODIFIED on our writes) must not flap."""
+    g = {"gid_evt1abc": gevent(START)}
+    ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+    s = SandboxSync(g, ic)
+    gr, ir = cycle(s)
+    assert gr["added"] == 1 and ir["added"] == 0, "first cycle should mirror once"
+    for _ in range(6):
+        gr, ir = cycle(s)
+        assert (gr["added"], gr["updated"], gr["deleted"]) == (0, 0, 0), gr
+        assert (ir["added"], ir["updated"], ir["deleted"]) == (0, 0, 0), ir
+
+
+def test_no_pingpong_regardless_of_server_behaviour():
+    for bump in (True, False):
+        for emit in (True, False):
+            g = {"gid_evt1abc": gevent(START)}
+            ic = FakeICloudCalendar(bump_on_update=bump, emit_last_modified=emit)
+            s = SandboxSync(g, ic)
+            cycle(s)  # initial mirror
+            for _ in range(5):
+                gr, ir = cycle(s)
+                assert gr["updated"] == 0 and ir["updated"] == 0, \
+                    f"flap with bump={bump} emit={emit}: {gr} {ir}"
+
+
+def test_icloud_origin_event_stable():
+    g = {}
+    ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+    ic._store(icloud_ics("dentist-uid-1", START))
+    s = SandboxSync(g, ic)
+    gr, ir = cycle(s)
+    assert ir["added"] == 1, "iCloud event should be added to Google once"
+    for _ in range(5):
+        gr, ir = cycle(s)
+        assert gr["updated"] == 0 and ir["updated"] == 0, f"{gr} {ir}"
+
+
+def test_genuine_google_edit_propagates_once():
+    g = {"gid_evt1abc": gevent(START)}
+    ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+    s = SandboxSync(g, ic)
+    cycle(s); cycle(s)  # reach steady state
+    # user edits the event in Google
+    g["gid_evt1abc"]["summary"] = "Team Meeting (moved)"
+    g["gid_evt1abc"]["updated"] = at(9000)
+    gr, ir = cycle(s)
+    assert gr["updated"] == 1, f"Google edit should propagate to iCloud: {gr}"
+    assert ic.summary_of("gid_evt1abc") == "Team Meeting (moved)"
+    # and then settle
+    gr, ir = cycle(s)
+    assert gr["updated"] == 0 and ir["updated"] == 0, f"should settle: {gr} {ir}"
+
+
+def test_genuine_icloud_edit_propagates_once():
+    g = {}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    ic._store(icloud_ics("dentist-uid-1", START))
+    s = SandboxSync(g, ic)
+    cycle(s); cycle(s)  # reach steady state
+    ic.user_edit("dentist-uid-1", "Dentist (rescheduled)")
+    gr, ir = cycle(s)
+    assert ir["updated"] == 1, f"iCloud edit should propagate to Google: {ir}"
+    gid = next(iter(g))
+    assert g[gid]["summary"] == "Dentist (rescheduled)"
+    gr, ir = cycle(s)
+    assert gr["updated"] == 0 and ir["updated"] == 0, f"should settle: {gr} {ir}"
+
+
+def test_cleanup_keeps_events_inside_window():
+    """_cleanup_past_events must not drop an event still inside the sync window
+    (start within the last day), which previously re-seeded change detection."""
+    s = SandboxSync({}, FakeICloudCalendar())
+    now = datetime.now(timezone.utc)
+    s.state["synced_events"] = {
+        "recent": {"title": "yesterday", "source": "google",
+                   "start": (now - timedelta(hours=20)).isoformat()},
+        "old":    {"title": "long past", "source": "google",
+                   "start": (now - timedelta(days=5)).isoformat()},
+    }
+    s._cleanup_past_events()
+    assert "recent" in s.state["synced_events"], "must keep event still in window"
+    assert "old" not in s.state["synced_events"], "must drop event well past window"
+
+
+def _run_all():
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for t in tests:
+        global _counter, _base
+        _counter = itertools.count()  # reset clock per test for determinism
+        try:
+            t(); print(f"  PASS  {t.__name__}")
+        except AssertionError as e:
+            failed += 1; print(f"  FAIL  {t.__name__}: {e}")
+        except Exception as e:
+            failed += 1; print(f"  ERROR {t.__name__}: {type(e).__name__}: {e}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return failed
+
+if __name__ == "__main__":
+    sys.exit(1 if _run_all() else 0)

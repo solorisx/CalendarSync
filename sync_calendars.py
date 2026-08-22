@@ -82,6 +82,35 @@ def retry(fn, retries=3, delay=5, backoff=2):
             logger.warning(f"Request failed ({e}), retrying in {wait}s (attempt {attempt + 1}/{retries})...")
             time.sleep(wait)
 
+
+def _parse_instant(value):
+    """Parse a timestamp (RFC3339 / ISO 8601, with 'Z' or offset, date or
+    datetime) into a timezone-aware UTC datetime. Returns None if unparseable."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _same_instant(a, b):
+    """Compare two timestamps as points in time, tolerant of format/precision
+    differences (e.g. Google's millisecond 'Z' form vs iCloud's second-precision
+    offset form). Falls back to raw equality only if neither parses.
+
+    NOTE: change detection compares each source's timestamp against its OWN
+    stored baseline. Never compare a Google timestamp against an iCloud one:
+    they use different formats and precisions and will never match, which is
+    exactly what produced the update ping-pong."""
+    da, db = _parse_instant(a), _parse_instant(b)
+    if da is None or db is None:
+        return a == b
+    return abs((da - db).total_seconds()) < 1.0
+
 class CalendarSync:
     def __init__(self):
         self.config = self.load_config()
@@ -108,20 +137,27 @@ class CalendarSync:
             json.dump(self.state, f, indent=2)
 
     def _cleanup_past_events(self):
-        """Remove past events from sync state to keep it lean"""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        """Remove past events from sync state to keep it lean.
+
+        The cutoff is kept a full day BEHIND the sync window's trailing edge
+        (now - 1 day). If cleanup dropped events still inside the active window,
+        the next sync would re-record them from scratch — resetting their change
+        detection baseline and re-igniting the update ping-pong — or the deletion
+        pass could momentarily treat them as user-initiated deletions. The extra
+        day of margin guarantees an event has fully left the sync window before
+        it becomes eligible for cleanup. Datetime comparison (not date-only) is
+        used so it stays consistent with the datetime-based sync window."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
         to_remove = []
         for event_id, event_info in self.state['synced_events'].items():
             event_start = event_info.get('start')
             if not event_start:
                 continue
-            try:
-                dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
-                event_date = dt.date() if isinstance(dt, datetime) else dt
-                if event_date < cutoff:
-                    to_remove.append(event_id)
-            except Exception:
-                pass
+            dt = _parse_instant(event_start)
+            if dt is None:
+                continue
+            if dt < cutoff:
+                to_remove.append(event_id)
         for event_id in to_remove:
             del self.state['synced_events'][event_id]
         if to_remove:
@@ -402,15 +438,24 @@ class CalendarSync:
                 continue
 
             if event_uid in self.state['synced_events'] and not self.state['synced_events'][event_uid].get('sync_failed'):
-                # Event already successfully synced — skip unless Google's timestamp changed
+                # Event already successfully synced — propagate only if Google's
+                # OWN timestamp advanced past the stored Google baseline. Never
+                # fall back to the iCloud timestamp: that cross-source comparison
+                # is what produced the update ping-pong.
                 last_modified = event.get('updated')
                 stored_state = self.state['synced_events'][event_uid]
-                stored_modified = stored_state.get('last_modified_google') or stored_state.get('last_modified') or stored_state.get('synced_at')
+                baseline = stored_state.get('last_modified_google')
+                if baseline is None:
+                    # No Google baseline yet (e.g. a legacy state entry). Capture
+                    # it now and do not propagate on this pass.
+                    stored_state['last_modified_google'] = last_modified
+                    logger.debug(f"  Captured Google baseline for '{event_title}' (no propagation)")
+                    continue
                 logger.debug(f"  Event already synced. Checking for modifications...")
                 logger.debug(f"    Last modified in Google: {last_modified}")
-                logger.debug(f"    Last modified in state (google): {stored_modified}")
-                if last_modified and stored_modified and last_modified != stored_modified:
-                    logger.debug(f"  Event modified: {event_title} (was: {stored_modified}, now: {last_modified})")
+                logger.debug(f"    Stored Google baseline: {baseline}")
+                if last_modified and not _same_instant(last_modified, baseline):
+                    logger.debug(f"  Event modified: {event_title} (was: {baseline}, now: {last_modified})")
                     # Update the existing iCloud event
                     if safe_uid in existing_icloud_events:
                         try:
@@ -439,6 +484,11 @@ class CalendarSync:
                             self.state['synced_events'][event_uid]['last_modified_google'] = last_modified
                             self.state['synced_events'][event_uid]['last_modified'] = last_modified
                             self.state['synced_events'][event_uid]['title'] = event.get('summary')
+                            # Our own write may bump iCloud's LAST-MODIFIED. Invalidate
+                            # the iCloud baseline so the reverse pass re-captures the
+                            # post-write timestamp instead of mistaking it for a user
+                            # edit and bouncing the change back (ping-pong).
+                            self.state['synced_events'][event_uid]['last_modified_icloud'] = None
                             updated_count += 1
                             event_start = event['start'].get('dateTime', event['start'].get('date'))
                             updated_events.append({'title': event.get('summary'), 'start': event_start})
@@ -531,21 +581,24 @@ class CalendarSync:
                 event_start = event_info.get('start')
                 logger.debug(f"Checking synced event: {event_info.get('title')} (ID: {event_id}, start: {event_start})")
                 if event_start:
-                    try:
-                        # Parse the event start time
-                        event_dt = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
-                        # Only consider for deletion if within our query window
-                        if time_min <= event_dt.isoformat() <= time_max:
+                    # Compare as instants, not as strings. The previous string
+                    # comparison mixed 'Z' and '+00:00' forms, so the window test
+                    # misfired at the boundaries. Use the same datetime window the
+                    # Google query was built from (and mirror the iCloud side).
+                    event_dt = _parse_instant(event_start)
+                    if event_dt is None:
+                        logger.debug(f"  → Could not parse date for {event_id}")
+                    else:
+                        window_start = now - timedelta(days=1)
+                        window_end = now + timedelta(days=360)
+                        if window_start <= event_dt <= window_end:
                             if event_id not in current_google_ids:
                                 logger.debug(f"  → Marked for deletion: not in current Google events")
                                 events_to_delete.append(event_id)
                             else:
                                 logger.debug(f"  → Still exists in Google")
                         else:
-                            logger.debug(f"  → Outside time window (event: {event_dt.isoformat()}, window: {time_min} to {time_max})")
-                    except Exception as e:
-                        # If we can't parse the date, skip this event
-                        logger.debug(f"  → Could not parse date: {e}")
+                            logger.debug(f"  → Outside time window (event: {event_dt.isoformat()}, window: {window_start.isoformat()} to {window_end.isoformat()})")
 
         # Delete events from iCloud that were deleted from Google
         logger.debug(f"Events to delete from iCloud: {len(events_to_delete)}")
@@ -717,12 +770,22 @@ class CalendarSync:
                     last_modified = last_modified_prop.dt.isoformat() if last_modified_prop and hasattr(last_modified_prop.dt, 'isoformat') else None
 
                     if event_id in self.state['synced_events']:
-                        # Check if modified since last sync — compare against iCloud timestamp only
+                        # Propagate only if iCloud's OWN timestamp advanced past the
+                        # stored iCloud baseline. Compare against the iCloud baseline
+                        # only — never fall back to the Google timestamp.
                         stored_state = self.state['synced_events'][event_id]
-                        stored_modified = stored_state.get('last_modified_icloud') or stored_state.get('last_modified') or stored_state.get('synced_at')
-                        if last_modified and stored_modified and last_modified != stored_modified:
+                        baseline = stored_state.get('last_modified_icloud')
+                        if baseline is None:
+                            # First time we have an iCloud-side baseline for this
+                            # event (typically a Google-origin event we just
+                            # mirrored, or a legacy entry). Capture it and do NOT
+                            # propagate — this is what caused the update ping-pong.
+                            stored_state['last_modified_icloud'] = last_modified
+                            logger.debug(f"  Captured iCloud baseline for '{component.get('summary')}' (no propagation)")
+                            continue
+                        if last_modified and not _same_instant(last_modified, baseline):
                             event_title = str(component.get('summary', 'No Title')) + (" (recurring)" if recurrence_id else "")
-                            logger.debug(f"  Event modified: {event_title} (was: {stored_modified}, now: {last_modified})")
+                            logger.debug(f"  Event modified: {event_title} (was: {baseline}, now: {last_modified})")
                             # Find the Google event and update it
                             g_event = existing_google_events.get(event_id)
                             if g_event:
@@ -750,6 +813,10 @@ class CalendarSync:
                                     self.state['synced_events'][event_id]['last_modified_icloud'] = last_modified
                                     self.state['synced_events'][event_id]['last_modified'] = last_modified
                                     self.state['synced_events'][event_id]['title'] = event_title
+                                    # Our patch bumps Google's `updated`. Invalidate the
+                                    # Google baseline so the forward pass re-captures the
+                                    # post-write timestamp instead of bouncing it back.
+                                    self.state['synced_events'][event_id]['last_modified_google'] = None
                                     updated_count += 1
                                     event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
                                     updated_events.append({'title': event_title, 'start': event_start})
