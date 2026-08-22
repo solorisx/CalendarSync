@@ -40,9 +40,11 @@ class _Exec:
     def execute(self):     return self._v
 
 class FakeGoogleEvents:
-    def __init__(self, store): self.store = store
+    def __init__(self, store): self.store = store; self.last_time_min = None; self.last_time_max = None
     def list(self, calendarId=None, timeMin=None, timeMax=None, singleEvents=None,
              orderBy=None, pageToken=None, iCalUID=None):
+        if timeMin is not None: self.last_time_min = timeMin
+        if timeMax is not None: self.last_time_max = timeMax
         items = list(self.store.values())
         if iCalUID is not None:
             items = [e for e in items if e.get("iCalUID") == iCalUID]
@@ -262,6 +264,46 @@ def test_state_recovers_from_corruption():
         assert "good" in loaded["synced_events"], f"should recover from backup: {loaded}"
     finally:
         sync_calendars.STATE_FILE = old
+
+
+def test_sync_window_env_and_config_precedence():
+    from datetime import datetime as _dt, timezone as _tz
+    obj = CalendarSync.__new__(CalendarSync)
+    fixed = _dt(2026, 1, 1, tzinfo=_tz.utc)
+    old_past, old_future = sync_calendars.SYNC_PAST_DAYS, sync_calendars.SYNC_FUTURE_DAYS
+    try:
+        sync_calendars.SYNC_PAST_DAYS = 1
+        sync_calendars.SYNC_FUTURE_DAYS = 1825
+        # env/module defaults
+        obj.config = {}
+        now, start_dt, end_dt, tmin, tmax = obj._sync_window(now=fixed)
+        assert (fixed - start_dt).days == 1
+        assert (end_dt - fixed).days == 1825, (end_dt - fixed).days
+        # config.json overrides env
+        obj.config = {"sync_past_days": 3, "sync_future_days": 30}
+        _, start_dt, end_dt, _, _ = obj._sync_window(now=fixed)
+        assert (fixed - start_dt).days == 3 and (end_dt - fixed).days == 30
+    finally:
+        sync_calendars.SYNC_PAST_DAYS, sync_calendars.SYNC_FUTURE_DAYS = old_past, old_future
+
+
+def test_queries_use_configured_future_horizon():
+    """Prove every hardcoded +360d literal was replaced: the Google query's timeMax
+    must sit ~5y out (default), not ~1y. A far-future one-off is no longer clipped."""
+    from datetime import datetime as _dt, timezone as _tz
+    old_future = sync_calendars.SYNC_FUTURE_DAYS
+    try:
+        sync_calendars.SYNC_FUTURE_DAYS = 1825
+        g = {"gid_evt1abc": gevent(START)}
+        ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+        s = SandboxSync(g, ic)
+        cycle(s)
+        tmax = s._google._e.last_time_max
+        horizon = (_parse := __import__("sync_calendars")._parse_instant)(tmax)
+        days_out = (horizon - _dt.now(_tz.utc)).days
+        assert days_out > 1000, f"future horizon only {days_out}d out — literal not replaced"
+    finally:
+        sync_calendars.SYNC_FUTURE_DAYS = old_future
 
 
 def _run_all():

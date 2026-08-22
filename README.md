@@ -155,7 +155,7 @@ Then restart: `docker-compose restart`
 ### Sync Process
 
 1. **Every 15 minutes** (configurable), the service:
-   - Fetches events from Google Calendar (yesterday to +90 days)
+   - Fetches events from Google Calendar (yesterday to +5 years by default; configurable via `SYNC_PAST_DAYS` / `SYNC_FUTURE_DAYS`)
    - Fetches events from iCloud Calendar (same range)
    - Compares with previously synced events
    - Adds new events to the opposite calendar
@@ -235,7 +235,7 @@ python initial_auth.py
 ### No events syncing
 
 **Possible causes:**
-1. **Time range** - Only syncs events from yesterday to +90 days
+1. **Time range** - Syncs events from yesterday to +5 years by default (`SYNC_PAST_DAYS` / `SYNC_FUTURE_DAYS`)
 2. **Already synced** - Check `data/sync_state.json` to see tracked events
 3. **Wrong calendar** - Verify `google_calendar_id` and `calendar_name`
 4. **API errors** - Rate limits, by default failed syncs will not be retried, reset state as below

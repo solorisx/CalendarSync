@@ -6,5 +6,7 @@
     "password": "app-specific-password",
     "calendar_name": null
   },
-  "notify_url": "https://ntfy.sh/your-channel"
+  "notify_url": "https://ntfy.sh/your-channel",
+  "sync_past_days": 1,
+  "sync_future_days": 1825
 }

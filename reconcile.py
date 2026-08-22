@@ -269,10 +269,15 @@ def reconcile():
 
     synced_events = state.get('synced_events', {})
 
-    # Time window (same as sync: yesterday → +90 days)
+    # Time window — must match the sync engine's window exactly, otherwise reconcile
+    # reports false Google-only/iCloud-only diffs for the band the sync manages but
+    # reconcile doesn't scan. Same env defaults as sync_calendars (SYNC_PAST_DAYS /
+    # SYNC_FUTURE_DAYS). (Phase 5 will hoist these into a shared module.)
+    past_days = int(os.getenv('SYNC_PAST_DAYS', '1'))
+    future_days = int(os.getenv('SYNC_FUTURE_DAYS', '1825'))
     now = datetime.now(timezone.utc)
-    start_dt = now - timedelta(days=1)
-    end_dt = now + timedelta(days=90)
+    start_dt = now - timedelta(days=past_days)
+    end_dt = now + timedelta(days=future_days)
     time_min = start_dt.isoformat().replace('+00:00', 'Z')
     time_max = end_dt.isoformat().replace('+00:00', 'Z')
 

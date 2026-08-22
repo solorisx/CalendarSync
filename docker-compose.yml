@@ -10,4 +10,10 @@ services:
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-172800}
       - HEARTBEAT_DAY_START=${HEARTBEAT_DAY_START:-8}
       - HEARTBEAT_DAY_END=${HEARTBEAT_DAY_END:-22}
+      - RECONCILE_HOUR=${RECONCILE_HOUR:-14}
+      # Sync window. PAST keeps recently-passed events in scope briefly; FUTURE is
+      # large by design so ordinary future events are never clipped (recurring events
+      # carry RRULE, so the window no longer bounds recurrence expansion).
+      - SYNC_PAST_DAYS=${SYNC_PAST_DAYS:-1}
+      - SYNC_FUTURE_DAYS=${SYNC_FUTURE_DAYS:-1825}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

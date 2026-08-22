@@ -45,6 +45,14 @@ HEARTBEAT_DAY_END = int(os.getenv('HEARTBEAT_DAY_END', '22'))       # hour (0-23
 RECONCILE_HOUR = int(os.getenv('RECONCILE_HOUR', '14'))  # hour of day to run daily reconcile
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()  # DEBUG, INFO, WARNING, ERROR
 
+# Sync time window. The PAST bound keeps recently-passed events in scope for a short
+# while; the FUTURE bound is intentionally large. The window's only historical job was
+# to bound infinite recurring-event expansion — once recurring events are synced as
+# real recurring series (RRULE), the future bound must NOT clip ordinary future events,
+# so it defaults to ~5 years. Both are overridable via env or config.json.
+SYNC_PAST_DAYS = int(os.getenv('SYNC_PAST_DAYS', '1'))
+SYNC_FUTURE_DAYS = int(os.getenv('SYNC_FUTURE_DAYS', '1825'))
+
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
 for handler in logging.root.handlers:
     handler.setFormatter(logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S'))
@@ -124,6 +132,24 @@ class CalendarSync:
         with open(CONFIG_FILE, 'r') as f:
             return json.load(f)
 
+    def _sync_window(self, now=None):
+        """Return the sync time window as (now, start_dt, end_dt, time_min, time_max).
+
+        Past/future bounds are configurable via env (SYNC_PAST_DAYS / SYNC_FUTURE_DAYS)
+        or config.json (sync_past_days / sync_future_days), config taking precedence.
+        This is the single source of truth for the query window — every Google
+        events().list and CalDAV date_search, and the deletion-detection gates, derive
+        their bounds from here so they can never drift apart again."""
+        if now is None:
+            now = datetime.now(timezone.utc)
+        past = int(self.config.get('sync_past_days', SYNC_PAST_DAYS))
+        future = int(self.config.get('sync_future_days', SYNC_FUTURE_DAYS))
+        start_dt = now - timedelta(days=past)
+        end_dt = now + timedelta(days=future)
+        time_min = start_dt.isoformat().replace('+00:00', 'Z')
+        time_max = end_dt.isoformat().replace('+00:00', 'Z')
+        return now, start_dt, end_dt, time_min, time_max
+
     def load_state(self):
         """Load sync state"""
         default = {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}
@@ -186,7 +212,8 @@ class CalendarSync:
         day of margin guarantees an event has fully left the sync window before
         it becomes eligible for cleanup. Datetime comparison (not date-only) is
         used so it stays consistent with the datetime-based sync window."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+        past = int(self.config.get('sync_past_days', SYNC_PAST_DAYS))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=past + 1)
         to_remove = []
         for event_id, event_info in self.state['synced_events'].items():
             event_start = event_info.get('start')
@@ -235,9 +262,7 @@ class CalendarSync:
         """
         google_service = self.get_google_service()
 
-        now = datetime.now(timezone.utc)
-        time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
-        time_max = (now + timedelta(days=360)).isoformat().replace('+00:00', 'Z')
+        now, start_dt, end_dt, time_min, time_max = self._sync_window()
 
         # Get all Google events
         events_result = google_service.events().list(
@@ -367,9 +392,7 @@ class CalendarSync:
         """Sync events from Google Calendar to iCloud"""
         logger.info("→ Syncing Google → iCloud...")
 
-        now = datetime.now(timezone.utc)
-        time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
-        time_max = (now + timedelta(days=360)).isoformat().replace('+00:00', 'Z')
+        now, start_dt, end_dt, time_min, time_max = self._sync_window()
 
         logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
         logger.debug(f"Time range: {time_min} to {time_max}")
@@ -427,8 +450,8 @@ class CalendarSync:
         try:
             with SuppressCaldavOutput():
                 icloud_events = icloud_calendar.date_search(
-                    start=now - timedelta(days=1),
-                    end=now + timedelta(days=360),
+                    start=start_dt,
+                    end=end_dt,
                     expand=True
                 )
             for icloud_event in icloud_events:
@@ -628,8 +651,8 @@ class CalendarSync:
                     if event_dt is None:
                         logger.debug(f"  → Could not parse date for {event_id}")
                     else:
-                        window_start = now - timedelta(days=1)
-                        window_end = now + timedelta(days=360)
+                        window_start = start_dt
+                        window_end = end_dt
                         if window_start <= event_dt <= window_end:
                             if event_id not in current_google_ids:
                                 logger.debug(f"  → Marked for deletion: not in current Google events")
@@ -647,8 +670,8 @@ class CalendarSync:
                 # Find and delete the event in iCloud by UID
                 with SuppressCaldavOutput():
                     icloud_events = list(icloud_calendar.date_search(
-                        start=now - timedelta(days=1),
-                        end=now + timedelta(days=360),
+                        start=start_dt,
+                        end=end_dt,
                         expand=True
                     ))
                 logger.debug(f"  Searching through {len(icloud_events)} iCloud events")
@@ -712,9 +735,7 @@ class CalendarSync:
         """Sync events from iCloud to Google Calendar"""
         logger.info("← Syncing iCloud → Google...")
 
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(days=1)
-        end = now + timedelta(days=360)
+        now, start, end, time_min, time_max = self._sync_window()
 
         with SuppressCaldavOutput():
             events = icloud_calendar.date_search(start=start, end=end, expand=True)
@@ -740,9 +761,6 @@ class CalendarSync:
         # Get existing Google events to check for duplicates
         existing_google_events = {}
         try:
-            time_min = start.isoformat().replace('+00:00', 'Z')
-            time_max = end.isoformat().replace('+00:00', 'Z')
-
             logger.debug(f"Querying Google Calendar: {self.config['google_calendar_id']}")
             logger.debug(f"Time range: {time_min} to {time_max}")
 
