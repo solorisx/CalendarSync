@@ -149,6 +149,48 @@ def test_icloud_exdate_propagates_to_google():
     assert any("RRULE" in r for r in rec) and any("EXDATE" in r for r in rec), rec
 
 
+def _gmaster(gid, start, recurrence, updated="2026-01-01T00:00:00Z"):
+    return {gid: {"id": gid, "iCalUID": gid + "@google.com", "summary": "Standup",
+                  "recurrence": recurrence,
+                  "start": {"dateTime": start.isoformat().replace("+00:00", "Z")},
+                  "end": {"dateTime": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+                  "updated": updated}}
+
+
+def _cancelled_exception(ex_id, parent, raw):
+    return {ex_id: {"id": ex_id, "status": "cancelled", "recurringEventId": parent,
+                    "originalStartTime": {"dateTime": raw}}}
+
+
+def test_google_cancelled_occurrence_becomes_exdate_in_icloud():
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {}
+    g.update(_gmaster("gid_weekly", start, ["RRULE:FREQ=WEEKLY"]))
+    g.update(_cancelled_exception("gid_weekly_ex1", "gid_weekly", "2026-03-09T09:00:00Z"))
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    ve = _one_icloud_vevent(ic)
+    assert ve.get("rrule") is not None
+    assert ve.get("exdate") is not None, "cancelled Google occurrence must become an EXDATE"
+
+
+def test_google_later_cancellation_propagates_via_recurrence_sig():
+    """Cancelling an occurrence may not bump the master's `updated`; the recurrence
+    signature must still catch it and propagate the new EXDATE."""
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = _gmaster("gid_weekly2", start, ["RRULE:FREQ=WEEKLY"])
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    assert _one_icloud_vevent(ic).get("exdate") is None
+    # user cancels one occurrence in Google (master.updated unchanged)
+    g.update(_cancelled_exception("gid_weekly2_ex1", "gid_weekly2", "2026-03-09T09:00:00Z"))
+    gr, ir = cycle(s)
+    assert gr["updated"] == 1, "recurrence change should trigger an iCloud update"
+    assert _one_icloud_vevent(ic).get("exdate") is not None
+
+
 def test_migration_flags_legacy_fanout_only():
     loaded = {"synced_events": {
         "uid_2026-03-02T09:00:00+00:00": {"title": "Standup (recurring)", "source": "icloud"},

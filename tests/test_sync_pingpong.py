@@ -42,7 +42,7 @@ class _Exec:
 class FakeGoogleEvents:
     def __init__(self, store): self.store = store; self.last_time_min = None; self.last_time_max = None
     def list(self, calendarId=None, timeMin=None, timeMax=None, singleEvents=None,
-             orderBy=None, pageToken=None, iCalUID=None):
+             orderBy=None, pageToken=None, iCalUID=None, showDeleted=None, **kwargs):
         if timeMin is not None: self.last_time_min = timeMin
         if timeMax is not None: self.last_time_max = timeMax
         items = list(self.store.values())

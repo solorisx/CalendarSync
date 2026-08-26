@@ -216,6 +216,19 @@ class CalendarSync:
                 out.append(f"{k}{';TZID=' + str(tzid) if tzid else ''}:{val}")
         return out
 
+    @staticmethod
+    def _google_exdate_line(raw):
+        """Build an EXDATE content line from a Google originalStartTime value:
+        a datetime ('2026-03-02T09:00:00Z' or with offset) or an all-day date
+        ('2026-03-02'). Used to translate a cancelled Google occurrence into an
+        EXDATE on the iCloud master."""
+        if 'T' in raw:
+            dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc)
+            return "EXDATE:" + dt.strftime("%Y%m%dT%H%M%SZ")
+        return "EXDATE;VALUE=DATE:" + raw.replace('-', '')
+
     def load_state(self):
         """Load sync state"""
         default = {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}
@@ -489,6 +502,7 @@ class CalendarSync:
                 timeMin=time_min,
                 timeMax=time_max,
                 singleEvents=False,
+                showDeleted=True,  # surface cancelled occurrences -> EXDATE on the master
                 pageToken=page_token
             ).execute()
             events.extend(events_result.get('items', []))
@@ -509,16 +523,32 @@ class CalendarSync:
         # With singleEvents=False a recurring series returns as ONE master event carrying
         # a recurrence[] array (RRULE/RDATE/EXDATE) — written to iCloud as a single recurring
         # VEVENT rather than N per-occurrence copies. Exception items (recurringEventId set)
-        # are individual modified/cancelled occurrences; per-instance overrides are not synced
-        # as separate events in this pass. (Occurrence cancellations that live on the master's
-        # own EXDATE still sync, because they travel inside recurrence[].)
+        # are individual modified/cancelled occurrences:
+        #   - cancelled occurrence  -> add its originalStartTime as an EXDATE on the master
+        #   - modified occurrence   -> not synced as a separate event in this pass
+        # cancelled_exdates maps a master's Google id -> list of EXDATE content lines.
+        cancelled_exdates = {}
         base_events = []
         for event in events:
-            if event.get('recurringEventId'):
-                logger.debug(f"  Skipping recurring exception/override (not synced separately): {event.get('summary')}")
+            parent = event.get('recurringEventId')
+            if event.get('status') == 'cancelled':
+                if parent:
+                    ost = event.get('originalStartTime') or {}
+                    raw = ost.get('dateTime') or ost.get('date')
+                    if raw:
+                        cancelled_exdates.setdefault(parent, []).append(self._google_exdate_line(raw))
+                # a cancelled single/master (not an exception) is just gone — ignore here;
+                # deletion propagation handles removing it from iCloud.
+                continue
+            if parent:
+                logger.debug(f"  Skipping modified recurring override (not synced separately): {event.get('summary')}")
                 continue
             base_events.append(event)
         events = base_events
+
+        def _recurrence_for(ev):
+            """Master recurrence[] merged with any cancelled-occurrence EXDATEs."""
+            return list(ev.get('recurrence') or []) + cancelled_exdates.get(ev['id'], [])
 
         # Track current Google event UIDs (use plain event ID, not iCalUID)
         # We use event['id'] to match what we store in sync_state
@@ -590,8 +620,14 @@ class CalendarSync:
                 logger.debug(f"  Event already synced. Checking for modifications...")
                 logger.debug(f"    Last modified in Google: {last_modified}")
                 logger.debug(f"    Stored Google baseline: {baseline}")
-                if last_modified and not _same_instant(last_modified, baseline):
-                    logger.debug(f"  Event modified: {event_title} (was: {baseline}, now: {last_modified})")
+                # Also propagate when the recurrence changed (e.g. an occurrence was
+                # cancelled) — that can alter the series without bumping the master's
+                # `updated` timestamp, so a timestamp-only check would miss it.
+                cur_rec_sig = sorted(_recurrence_for(event))
+                stored_rec_sig = stored_state.get('recurrence_sig')
+                recurrence_changed = stored_rec_sig is not None and cur_rec_sig != stored_rec_sig
+                if (last_modified and not _same_instant(last_modified, baseline)) or recurrence_changed:
+                    logger.debug(f"  Event modified: {event_title} (was: {baseline}, now: {last_modified}, recurrence_changed={recurrence_changed})")
                     # Update the existing iCloud event
                     if safe_uid in existing_icloud_events:
                         try:
@@ -615,13 +651,14 @@ class CalendarSync:
                                     component.pop('rrule', None)
                                     component.pop('rdate', None)
                                     component.pop('exdate', None)
-                                    self._apply_google_recurrence(component, event.get('recurrence'))
+                                    self._apply_google_recurrence(component, _recurrence_for(event))
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
                             self.state['synced_events'][event_uid]['last_modified_google'] = last_modified
                             self.state['synced_events'][event_uid]['last_modified'] = last_modified
                             self.state['synced_events'][event_uid]['title'] = event.get('summary')
+                            self.state['synced_events'][event_uid]['recurrence_sig'] = cur_rec_sig
                             # Our own write may bump iCloud's LAST-MODIFIED. Invalidate
                             # the iCloud baseline so the reverse pass re-captures the
                             # post-write timestamp instead of mistaking it for a user
@@ -648,6 +685,7 @@ class CalendarSync:
                     icloud_uid=safe_uid,
                     last_modified_google=event.get('updated')
                 )
+                self.state['synced_events'][event_uid]['recurrence_sig'] = sorted(_recurrence_for(event))
                 logger.debug(f"Skipped (already exists in iCloud): {event.get('summary')}")
                 continue
 
@@ -664,10 +702,9 @@ class CalendarSync:
             ical_event.add('dtend', ev_end)
             ical_event.add('uid', safe_uid)
 
-            # Carry the recurrence (RRULE/RDATE/EXDATE, incl. any occurrence cancellations
-            # already on the master) so a recurring series is written to iCloud as ONE
-            # recurring VEVENT, not N copies.
-            self._apply_google_recurrence(ical_event, event.get('recurrence'))
+            # Carry the recurrence (RRULE/RDATE/EXDATE, plus any occurrence cancellations)
+            # so a recurring series is written to iCloud as ONE recurring VEVENT, not N copies.
+            self._apply_google_recurrence(ical_event, _recurrence_for(event))
 
             # Add 30-minute reminder
             alarm = Alarm()
@@ -687,6 +724,7 @@ class CalendarSync:
                     start=event_start, last_modified=event.get('updated'),
                     icloud_uid=safe_uid, last_modified_google=event.get('updated')
                 )
+                self.state['synced_events'][event_uid]['recurrence_sig'] = sorted(_recurrence_for(event))
                 synced_count += 1
                 added_events.append({
                     'title': event.get('summary'),
