@@ -6,5 +6,11 @@
     "password": "app-specific-password",
     "calendar_name": null
   },
+  "oneway_google_calendars": [
+    {
+      "calendar_id": "team-calendar-id@group.calendar.google.com",
+      "prefix": "[Team] "
+    }
+  ],
   "notify_url": "https://ntfy.sh/your-channel"
 }
