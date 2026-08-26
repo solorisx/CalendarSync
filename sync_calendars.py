@@ -12,6 +12,7 @@ import requests
 import time
 import logging
 import hashlib
+import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone, date
 from icalendar import Calendar, Event, Alarm
@@ -45,6 +46,10 @@ CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.pickle')
 STATE_FILE = os.path.join(DATA_DIR, 'sync_state.json')
 CREDENTIALS_FILE = os.path.join(DATA_DIR, 'credentials.json')
+
+# UIDs we mint for one-way mirrored events: "ow-<12-hex calendar hash>-<id>".
+# Structural, so a mirrored event can be recognised without consulting sync state.
+ONEWAY_UID_RE = re.compile(r'^ow-[0-9a-f]{12}-')
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', '900'))  # 15 minutes default
@@ -1369,6 +1374,14 @@ class CalendarSync:
                     # When a Google event has a very long UID, we hash it before writing to iCloud.
                     # The iCloud→Google direction sees the hashed UID and wouldn't find it in
                     # existing_google_events, causing it to add the event back to Google as new.
+                    # A one-way mirrored event carries a UID we minted ourselves. Recognise
+                    # it structurally rather than trusting its state entry to still be
+                    # there: losing that entry is exactly what let mirrored events get
+                    # pushed back into the primary Google calendar.
+                    if ONEWAY_UID_RE.match(str(event_id)):
+                        logger.debug(f"  Skipping: one-way mirrored event, never synced back: {component.get('summary')}")
+                        continue
+
                     if event_id in google_origin_icloud_uids:
                         logger.debug(f"  Skipping: iCloud event with hashed UID originated from Google: {component.get('summary')}")
                         continue

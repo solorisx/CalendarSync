@@ -433,6 +433,28 @@ def test_legacy_icloud_uid_spelling_is_preserved():
     assert set(ic.store) == before, f"legacy spelling must be reused, not duplicated: {set(ic.store) - before}"
 
 
+def test_oneway_mirrored_event_never_pushed_back_to_google():
+    """A one-way mirrored event must never be pushed into the primary Google
+    calendar, even with no state entry vouching for it — losing that entry is
+    what let the mirror leak back into Google in the first place."""
+    ic = FakeICloudCalendar()
+    mirrored_uid = "ow-de9daec6dee4-g4ac5ilmstg45j5re2v7qu72ek"
+    ic._store(icloud_ics(mirrored_uid, START, summary="Sascha at LOCATION"))
+    g = {}
+    s = SandboxSync(g, ic)
+    s.state["synced_events"] = {}          # state lost / pruned
+
+    gr, ir = cycle(s)
+    assert ir["added"] == 0, f"mirrored event pushed back to Google: {ir}"
+    assert g == {}, f"primary Google calendar was written to: {list(g)}"
+
+    # ...while an ordinary iCloud event beside it still syncs normally.
+    ic._store(icloud_ics("4A6E8C8E-EFC4-4E2E-915C-AD053A93D25E", START, summary="Dentist"))
+    gr, ir = cycle(s)
+    assert ir["added"] == 1, f"ordinary iCloud event must still sync: {ir}"
+    assert len(g) == 1, f"exactly one event should reach Google: {list(g)}"
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
