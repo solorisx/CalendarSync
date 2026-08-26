@@ -124,10 +124,10 @@ def gevent(start, summary="Team Meeting", updated=None):
             "end":   {"dateTime": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
             "updated": updated or tick_iso()}
 
-def icloud_ics(uid, start, summary="Dentist"):
+def icloud_ics(uid, start, summary="Dentist", end=None):
     cal = Calendar(); ev = Event()
     ev.add("summary", summary); ev.add("uid", uid)
-    ev.add("dtstart", start); ev.add("dtend", start + timedelta(hours=1))
+    ev.add("dtstart", start); ev.add("dtend", end or (start + timedelta(hours=1)))
     ev.add("last-modified", tick()); cal.add_component(ev)
     return cal.to_ical()
 
@@ -347,6 +347,90 @@ def test_hashed_uid_event_deletes_from_icloud():
     gr, ir = cycle(s)
     assert expected_uid not in ic.store, "hashed-uid event must be deleted, not orphaned"
     assert long_id not in s.state["synced_events"]
+
+
+def test_cleanup_ages_out_on_event_end_not_start():
+    """Cleanup must age entries out on when the event ENDS. A long event whose
+    start has slipped behind the window edge is still live — Google's timeMin
+    matches on end time and keeps returning it — so dropping its entry would
+    strip the marker that says 'already synced'."""
+    s = SandboxSync({}, FakeICloudCalendar())
+    now = datetime.now(timezone.utc)
+    s.state["synced_events"] = {
+        "running":  {"title": "started, still running", "source": "icloud",
+                     "start": (now - timedelta(days=4)).isoformat(),
+                     "end":   (now + timedelta(days=6)).isoformat()},
+        "finished": {"title": "long event, now over", "source": "icloud",
+                     "start": (now - timedelta(days=20)).isoformat(),
+                     "end":   (now - timedelta(days=9)).isoformat()},
+        "legacy":   {"title": "entry written before 'end' existed", "source": "google",
+                     "start": (now - timedelta(days=30)).isoformat()},
+    }
+    s._cleanup_past_events()
+    kept = s.state["synced_events"]
+    assert "running" in kept, "must keep a long event that is still running"
+    assert "finished" not in kept, "must drop an event that has fully ended"
+    assert "legacy" not in kept, "entries with no 'end' still age out on start"
+
+
+def test_long_running_event_not_duplicated_back_into_icloud():
+    """Regression for the 'Preparation time' duplicate: an iCloud event whose
+    start has passed but which is still running gets mirrored to Google, and must
+    never come back the other way as a second iCloud copy — cycle after cycle,
+    with cleanup running in between exactly as run_sync does it."""
+    now = datetime.now(timezone.utc)
+    ic = FakeICloudCalendar()
+    ic._store(icloud_ics("apple-uid-long", now - timedelta(days=2),
+                         summary="Preparation time", end=now + timedelta(days=9)))
+    s = SandboxSync({}, ic)
+
+    gr, ir = cycle(s)
+    assert ir["added"] == 1, f"should mirror to Google once: {ir}"
+
+    for n in range(4):
+        s._cleanup_past_events()
+        gr, ir = cycle(s)
+        assert gr["added"] == 0, f"cycle {n}: written back into iCloud: {gr}"
+        assert ir["added"] == 0, f"cycle {n}: re-added to Google: {ir}"
+    assert len(ic.store) == 1, f"expected one iCloud copy, got {list(ic.store)}"
+
+
+def test_icloud_origin_not_duplicated_after_state_loss():
+    """Belt and braces for the same bug: even with the state entry gone entirely,
+    the forward pass must recognise the event it pushed to Google by its foreign
+    iCalUID rather than deriving a fresh UID from Google's unrelated event id."""
+    ic = FakeICloudCalendar()
+    ic._store(icloud_ics("apple-uid-2", START))
+    s = SandboxSync({}, ic)
+    cycle(s)
+    assert len(ic.store) == 1, "setup: one copy after the first mirror"
+
+    s.state["synced_events"] = {}          # state pruned / lost
+    gr, ir = cycle(s)
+    assert len(ic.store) == 1, f"duplicate written back into iCloud: {list(ic.store)}"
+    assert gr["added"] == 0, gr
+
+
+def test_legacy_icloud_uid_spelling_is_preserved():
+    """Events existing installs already wrote under the id-derived UID must keep
+    that spelling — switching derivation must not orphan them into duplicates."""
+    g = {"gid_evt1abc": gevent(START)}
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    assert "gid_evt1abc" in ic.store, f"google-native event keeps its UID: {list(ic.store)}"
+
+    # An ICS-imported Google event carrying a foreign iCalUID, already mirrored
+    # into iCloud under the legacy spelling.
+    g["gid_imported"] = {"id": "gid_imported", "iCalUID": "imported-from-ics",
+                         "summary": "Imported",
+                         "start": {"dateTime": START.isoformat().replace("+00:00", "Z")},
+                         "end": {"dateTime": (START + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+                         "updated": tick_iso()}
+    ic._store(icloud_ics("gid_imported", START, summary="Imported"))
+    before = set(ic.store)
+    cycle(s)
+    assert set(ic.store) == before, f"legacy spelling must be reused, not duplicated: {set(ic.store) - before}"
 
 
 def _run_all():
