@@ -218,6 +218,40 @@ def test_legacy_fanout_single_not_auto_deleted_or_repushed():
     assert len(ic.store) == 0, "legacy fan-out single must NOT be re-pushed to iCloud"
 
 
+def test_writeback_of_recurring_google_event_keeps_signature_in_step():
+    """An RRULE edit made on the iCloud copy is written back to Google, and the stored
+    recurrence signature moves with it — otherwise the forward pass sees a phantom
+    recurrence change and bounces a spurious update straight back."""
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {"gid_weekly": {"id": "gid_weekly", "iCalUID": "gid_weekly@google.com",
+                        "summary": "Standup", "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+                        "start": {"dateTime": start.isoformat().replace("+00:00", "Z")},
+                        "end": {"dateTime": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+                        "updated": "2026-01-01T00:00:00Z"}}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    s = SandboxSync(g, ic)
+    cycle(s); cycle(s)
+    uid = next(iter(ic.store))
+
+    # User drops one occurrence in iCloud (adds an EXDATE) and renames the series.
+    cal = Calendar.from_ical(ic.store[uid])
+    ve = next(c for c in cal.walk() if c.name == "VEVENT")
+    ve.add('exdate', datetime(2026, 3, 9, 9, tzinfo=timezone.utc))
+    ve.pop('summary', None); ve.add('summary', "Standup (renamed in iCloud)")
+    ve.pop('last-modified', None); ve.add('last-modified', datetime(2026, 6, 1, tzinfo=timezone.utc))
+    ic.store[uid] = cal.to_ical()
+
+    gr, ir = cycle(s)
+    assert ir["writeback"] == 1, f"recurring edit should be written back: {ir}"
+    assert g["gid_weekly"]["summary"] == "Standup (renamed in iCloud)"
+    assert any("EXDATE" in r for r in g["gid_weekly"].get("recurrence", [])), \
+        f"EXDATE should have reached Google: {g['gid_weekly'].get('recurrence')}"
+    for _ in range(4):
+        gr, ir = cycle(s)
+        assert gr["updated"] == 0 and ir.get("writeback", 0) == 0, \
+            f"phantom recurrence change bounced back: {gr} {ir}"
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

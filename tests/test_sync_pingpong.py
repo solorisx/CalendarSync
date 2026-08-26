@@ -39,13 +39,26 @@ class _Exec:
     def __init__(self, v): self._v = v
     def execute(self):     return self._v
 
+class _FakeResp:
+    def __init__(self, status): self.status = status
+
+class FakeHttpError(Exception):
+    """Stands in for googleapiclient.errors.HttpError (same .resp.status surface)."""
+    def __init__(self, status): super().__init__(f"HTTP {status}"); self.resp = _FakeResp(status)
+
 class FakeGoogleEvents:
-    def __init__(self, store): self.store = store; self.last_time_min = None; self.last_time_max = None
+    def __init__(self, store, calendars=None, readonly=()):
+        self.store = store                      # the primary calendar
+        self.calendars = calendars or {}        # {calendar_id: store} for mirrored sources
+        self.readonly = set(readonly)           # calendar ids that reject writes with 403
+        self.last_time_min = None; self.last_time_max = None
+    def _store_for(self, calendarId):
+        return self.calendars.get(calendarId, self.store)
     def list(self, calendarId=None, timeMin=None, timeMax=None, singleEvents=None,
              orderBy=None, pageToken=None, iCalUID=None, showDeleted=None, **kwargs):
         if timeMin is not None: self.last_time_min = timeMin
         if timeMax is not None: self.last_time_max = timeMax
-        items = list(self.store.values())
+        items = list(self._store_for(calendarId).values())
         if iCalUID is not None:
             items = [e for e in items if e.get("iCalUID") == iCalUID]
         return _Exec({"items": items, "nextPageToken": None})
@@ -53,16 +66,20 @@ class FakeGoogleEvents:
         gid = "gid_" + (body.get("iCalUID", "").split("@")[0] or str(next(_counter)))
         ev = dict(body); ev["id"] = gid
         ev["iCalUID"] = body.get("iCalUID") or (gid + "@google.com")
-        ev["updated"] = tick_iso(); self.store[gid] = ev
+        ev["updated"] = tick_iso(); self._store_for(calendarId)[gid] = ev
         return _Exec(dict(ev))
     def patch(self, calendarId=None, eventId=None, body=None):
-        ev = self.store[eventId]; ev.update(body); ev["updated"] = tick_iso()
+        if calendarId in self.readonly: raise FakeHttpError(403)
+        store = self._store_for(calendarId)
+        if eventId not in store: raise FakeHttpError(404)
+        ev = store[eventId]; ev.update(body); ev["updated"] = tick_iso()
         return _Exec(dict(ev))
     def delete(self, calendarId=None, eventId=None):
-        self.store.pop(eventId, None); return _Exec({})
+        self._store_for(calendarId).pop(eventId, None); return _Exec({})
 
 class FakeGoogleService:
-    def __init__(self, store): self._e = FakeGoogleEvents(store)
+    def __init__(self, store, calendars=None, readonly=()):
+        self._e = FakeGoogleEvents(store, calendars=calendars, readonly=readonly)
     def events(self): return self._e
 
 class FakeICloudEvent:
@@ -105,9 +122,11 @@ class FakeICloudCalendar:
         self.store[uid] = cal.to_ical()
 
 class SandboxSync(CalendarSync):
-    def __init__(self, g, i):
-        self._google = FakeGoogleService(g); self._icloud = i
+    def __init__(self, g, i, calendars=None, readonly=(), config=None):
+        self._google = FakeGoogleService(g, calendars=calendars, readonly=readonly)
+        self._icloud = i
         self.config = {"google_calendar_id": "primary", "icloud": {"calendar_name": "Home"}}
+        if config: self.config.update(config)
         self.state = {"last_sync": None, "synced_events": {}, "last_error": None,
                       "last_notification_sent": None}
     def load_config(self): return self.config
@@ -135,6 +154,13 @@ def cycle(sync):
     g = sync.sync_google_to_icloud(sync._google, sync._icloud)
     i = sync.sync_icloud_to_google(sync._google, sync._icloud)
     return g, i
+
+def cycle_with_mirror(sync):
+    """Full run order as run_sync drives it: forward, mirror, then reverse."""
+    g = sync.sync_google_to_icloud(sync._google, sync._icloud)
+    o = sync.sync_google_oneway_to_icloud(sync._google, sync._icloud)
+    i = sync.sync_icloud_to_google(sync._google, sync._icloud)
+    return g, o, i
 
 START = datetime(2026, 3, 1, 10, tzinfo=timezone.utc)
 
@@ -164,6 +190,8 @@ def test_no_pingpong_regardless_of_server_behaviour():
                 gr, ir = cycle(s)
                 assert gr["updated"] == 0 and ir["updated"] == 0, \
                     f"flap with bump={bump} emit={emit}: {gr} {ir}"
+                assert ir.get("writeback", 0) == 0, \
+                    f"our own write mistaken for a user edit (bump={bump} emit={emit}): {ir}"
 
 
 def test_icloud_origin_event_stable():
@@ -453,6 +481,236 @@ def test_oneway_mirrored_event_never_pushed_back_to_google():
     gr, ir = cycle(s)
     assert ir["added"] == 1, f"ordinary iCloud event must still sync: {ir}"
     assert len(g) == 1, f"exactly one event should reach Google: {list(g)}"
+
+
+# ------------------ target-side write-back (sync_target_updates) -----------
+def _google_origin_steady(google_id="gid_evt1abc", **cfg):
+    """A Google-origin event already mirrored into iCloud and settled."""
+    ev = gevent(START)
+    ev["id"] = google_id
+    ev["iCalUID"] = google_id.lstrip("_") + "@google.com"
+    g = {google_id: ev}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    s = SandboxSync(g, ic, config=cfg or None)
+    cycle(s); cycle(s)                     # reach steady state
+    icloud_uid = next(iter(ic.store))
+    return g, ic, s, icloud_uid
+
+
+def test_icloud_edit_of_google_event_writes_back():
+    g, ic, s, uid = _google_origin_steady()
+    ic.user_edit(uid, "Team Meeting (edited in iCloud)")
+    gr, ir = cycle(s)
+    assert ir["writeback"] == 1, f"iCloud edit should be written back: {ir}"
+    assert g["gid_evt1abc"]["summary"] == "Team Meeting (edited in iCloud)"
+    assert ir["writeback_events"][0]["target"] == "Google"
+
+
+def test_icloud_edit_writes_back_with_mismatched_uid():
+    """Google ids starting with '_' are stripped for iCloud, so the state key and the
+    iCloud UID differ. That used to drop the edit silently."""
+    g, ic, s, uid = _google_origin_steady(google_id="_gid_underscore1")
+    assert uid == "gid_underscore1", f"precondition: UID should differ from state key ({uid})"
+    ic.user_edit(uid, "Edited despite rewritten UID")
+    gr, ir = cycle(s)
+    assert ir["writeback"] == 1, f"edit dropped for rewritten UID: {ir}"
+    assert g["_gid_underscore1"]["summary"] == "Edited despite rewritten UID"
+
+
+def test_first_edit_propagates_when_icloud_stamps_no_last_modified():
+    """iCloud does not stamp LAST-MODIFIED on the events we write, so most mirrored
+    events have no baseline at all. A timestamp APPEARING where we confirmed there was
+    none is a user edit — swallowing it would eat the first edit to every such event."""
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=False)
+    g = {"gid_evt1abc": gevent(START)}
+    s = SandboxSync(g, ic)
+    cycle(s); cycle(s)
+    uid = next(iter(ic.store))
+    entry = s.state["synced_events"]["gid_evt1abc"]
+    assert entry.get("last_modified_icloud") is None and entry.get("icloud_lm_absent") is True, \
+        f"absence should be recorded explicitly: {entry}"
+
+    # The user edits in the iCloud app; Apple stamps LAST-MODIFIED for the first time.
+    ic.emit_last_modified = True
+    ic.user_edit(uid, "Edited in the iCloud app")
+    _, ir = cycle(s)
+    assert ir["writeback"] == 1, f"first edit was swallowed: {ir}"
+    assert g["gid_evt1abc"]["summary"] == "Edited in the iCloud app"
+    for _ in range(4):
+        gr, ir = cycle(s)
+        assert ir.get("writeback", 0) == 0 and gr["updated"] == 0, f"should settle: {gr} {ir}"
+
+
+def test_no_writeback_while_icloud_never_stamps():
+    """The other half: with no timestamps at all we cannot tell an edit from our own
+    write, so nothing must be pushed back (and nothing may flap)."""
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=False)
+    s = SandboxSync({"gid_evt1abc": gevent(START)}, ic)
+    cycle(s)
+    for _ in range(5):
+        gr, ir = cycle(s)
+        assert ir.get("writeback", 0) == 0, f"write-back without any timestamp: {ir}"
+        assert gr["updated"] == 0 and ir["updated"] == 0, f"{gr} {ir}"
+
+
+def test_writeback_respects_flag():
+    g, ic, s, uid = _google_origin_steady(sync_target_updates={"to_google": False})
+    ic.user_edit(uid, "Should not reach Google")
+    gr, ir = cycle(s)
+    assert ir["writeback"] == 0, f"write-back should be disabled: {ir}"
+    assert g["gid_evt1abc"]["summary"] == "Team Meeting"
+
+
+def test_writeback_settles():
+    """Whether or not iCloud re-stamps LAST-MODIFIED on our writes, one edit must
+    produce exactly one write-back and then silence."""
+    for bump in (True, False):
+        ev = gevent(START)
+        ic = FakeICloudCalendar(bump_on_update=bump, emit_last_modified=True)
+        s = SandboxSync({"gid_evt1abc": ev}, ic)
+        cycle(s); cycle(s)
+        uid = next(iter(ic.store))
+        ic.user_edit(uid, "Edited once")
+        _, ir = cycle(s)
+        assert ir["writeback"] == 1, f"bump={bump}: {ir}"
+        for _ in range(5):
+            gr, ir = cycle(s)
+            assert ir.get("writeback", 0) == 0, f"write-back flapped (bump={bump}): {ir}"
+            assert gr["updated"] == 0 and ir["updated"] == 0, \
+                f"ping-pong after write-back (bump={bump}): {gr} {ir}"
+
+
+def test_google_edit_of_icloud_event_reaches_icloud():
+    """The old known limitation: an iCloud-owned event edited in Google stayed put."""
+    g = {}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    ic._store(icloud_ics("dentist-uid-1", START))
+    s = SandboxSync(g, ic)
+    cycle(s); cycle(s)
+    gid = next(iter(g))
+    g[gid]["summary"] = "Dentist (moved by Google)"
+    g[gid]["updated"] = at(9000)
+    gr, ir = cycle(s)
+    assert gr["updated"] == 1, f"Google edit should reach iCloud: {gr}"
+    assert ic.summary_of("dentist-uid-1") == "Dentist (moved by Google)"
+    for _ in range(5):
+        gr, ir = cycle(s)
+        assert gr["updated"] == 0 and ir["updated"] == 0, f"should settle: {gr} {ir}"
+
+
+def test_google_edit_of_icloud_event_respects_flag():
+    g = {}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    ic._store(icloud_ics("dentist-uid-1", START))
+    s = SandboxSync(g, ic, config={"sync_target_updates": {"to_icloud": False}})
+    cycle(s); cycle(s)
+    gid = next(iter(g))
+    g[gid]["summary"] = "Dentist (moved by Google)"; g[gid]["updated"] = at(9000)
+    gr, ir = cycle(s)
+    assert gr["updated"] == 0, f"write-back to iCloud should be disabled: {gr}"
+    assert ic.summary_of("dentist-uid-1") == "Dentist"
+
+
+def test_state_start_end_refreshed_on_update():
+    """A reschedule must move the cached start/end, or _cleanup_past_events prunes the
+    entry as 'past' and the event is re-created as a duplicate."""
+    g, ic, s, uid = _google_origin_steady()
+    moved = datetime.now(timezone.utc) + timedelta(days=30)
+    g["gid_evt1abc"]["start"] = {"dateTime": moved.isoformat().replace("+00:00", "Z")}
+    g["gid_evt1abc"]["end"] = {"dateTime": (moved + timedelta(hours=1)).isoformat().replace("+00:00", "Z")}
+    g["gid_evt1abc"]["updated"] = at(9000)
+    gr, _ = cycle(s)
+    assert gr["updated"] == 1, gr
+    entry = s.state["synced_events"]["gid_evt1abc"]
+    assert entry["start"].startswith(moved.date().isoformat()), f"stale start: {entry['start']}"
+    s._cleanup_past_events()
+    assert "gid_evt1abc" in s.state["synced_events"], "rescheduled event was pruned as past"
+
+
+# ------------------------- one-way mirror write-back ------------------------
+MIRROR_CAL = "team@group.calendar.google.com"
+
+def _mirror_setup(writeback, readonly=()):
+    source_event = {
+        "id": "gid_team1", "iCalUID": "gid_team1@google.com", "summary": "Standup",
+        "start": {"dateTime": START.isoformat().replace("+00:00", "Z")},
+        "end": {"dateTime": (START + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+        "updated": tick_iso()}
+    mirror_store = {"gid_team1": source_event}
+    ic = FakeICloudCalendar(bump_on_update=False, emit_last_modified=True)
+    s = SandboxSync({}, ic, calendars={MIRROR_CAL: mirror_store}, readonly=readonly,
+                    config={"oneway_google_calendars": [
+                        {"calendar_id": MIRROR_CAL, "prefix": "[Team] ", "writeback": writeback}]})
+    cycle_with_mirror(s); cycle_with_mirror(s)
+    uid = next(u for u in ic.store if u.startswith("ow-"))
+    return mirror_store, ic, s, uid
+
+
+def test_oneway_writeback_opt_in():
+    mirror_store, ic, s, uid = _mirror_setup(writeback=True)
+    ic.user_edit(uid, "[Team] Standup (moved)")
+    gr, o, ir = cycle_with_mirror(s)
+    assert ir["writeback"] == 1, f"mirror edit should reach its source calendar: {ir}"
+    assert mirror_store["gid_team1"]["summary"] == "Standup (moved)", "prefix must be stripped"
+    assert ir["writeback_events"][0]["target"] == MIRROR_CAL
+    assert s._google._e.store == {}, "the primary calendar must never be written to"
+
+
+def test_oneway_writeback_off_by_default():
+    mirror_store, ic, s, uid = _mirror_setup(writeback=False)
+    ic.user_edit(uid, "[Team] Standup (moved)")
+    gr, o, ir = cycle_with_mirror(s)
+    assert ir["writeback"] == 0, f"mirror write-back must be opt-in: {ir}"
+    assert ir["added"] == 0 and s._google._e.store == {}
+    assert mirror_store["gid_team1"]["summary"] == "Standup"
+
+
+def test_oneway_writeback_denied_is_quiet():
+    """A read-only shared calendar must be reported once, then stop retrying."""
+    mirror_store, ic, s, uid = _mirror_setup(writeback=True, readonly=(MIRROR_CAL,))
+    ic.user_edit(uid, "[Team] Standup (moved)")
+    gr, o, ir = cycle_with_mirror(s)
+    assert ir["writeback"] == 0 and ir["errors"] == 1, f"403 should be reported once: {ir}"
+    for _ in range(3):
+        gr, o, ir = cycle_with_mirror(s)
+        assert ir["errors"] == 0, f"denied write-back kept retrying: {ir}"
+        assert ir["added"] == 0, "denied write-back must not fall through to insert"
+
+
+def test_oneway_writeback_settles_against_bumping_server():
+    """After a write-back, the mirror re-writes the iCloud copy from Google. If iCloud
+    re-stamps LAST-MODIFIED on that write it must not read as a fresh user edit."""
+    source_event = {
+        "id": "gid_team1", "iCalUID": "gid_team1@google.com", "summary": "Standup",
+        "start": {"dateTime": START.isoformat().replace("+00:00", "Z")},
+        "end": {"dateTime": (START + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+        "updated": tick_iso()}
+    mirror_store = {"gid_team1": source_event}
+    ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+    s = SandboxSync({}, ic, calendars={MIRROR_CAL: mirror_store},
+                    config={"oneway_google_calendars": [
+                        {"calendar_id": MIRROR_CAL, "prefix": "[Team] ", "writeback": True}]})
+    cycle_with_mirror(s); cycle_with_mirror(s)
+    uid = next(u for u in ic.store if u.startswith("ow-"))
+    ic.user_edit(uid, "[Team] Standup (moved)")
+    _, _, ir = cycle_with_mirror(s)
+    assert ir["writeback"] == 1, ir
+    for _ in range(5):
+        _, o, ir = cycle_with_mirror(s)
+        assert ir.get("writeback", 0) == 0, f"mirror write-back flapped: {ir}"
+        assert o.get("updated", 0) == 0, f"mirror kept re-writing iCloud: {o}"
+
+
+def test_oneway_recurring_not_written_back():
+    """The mirror stores an expanded occurrence id, so a patch would edit one
+    occurrence of the source series. Refuse instead."""
+    mirror_store, ic, s, uid = _mirror_setup(writeback=True)
+    mirror_store["gid_team1"]["recurringEventId"] = "gid_team1_master"
+    cycle_with_mirror(s)
+    ic.user_edit(uid, "[Team] Standup (moved)")
+    gr, o, ir = cycle_with_mirror(s)
+    assert ir["writeback"] == 0, f"recurring mirror event must not be written back: {ir}"
+    assert mirror_store["gid_team1"]["summary"] == "Standup"
 
 
 def _run_all():

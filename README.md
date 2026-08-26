@@ -65,10 +65,15 @@ Edit `data/config.json`:
     "password": "xxxx-xxxx-xxxx-xxxx",
     "calendar_name": "Calendar"
   },
+  "sync_target_updates": {
+    "to_google": true,
+    "to_icloud": true
+  },
   "oneway_google_calendars": [
     {
       "calendar_id": "team-calendar-id@group.calendar.google.com",
-      "prefix": "[Team] "
+      "prefix": "[Team] ",
+      "writeback": false
     }
   ],
   "notify_url": "https://ntfy.sh/your-unique-channel"
@@ -78,8 +83,39 @@ Edit `data/config.json`:
 **Configuration notes:**
 - `google_calendar_id`: Use `"primary"` for your main calendar, or specific calendar ID
 - `calendar_name`: Name of your iCloud calendar (usually "Calendar", run sync to see available names in error message if wrong)
+- `sync_target_updates`: Optional - see [Editing the Copy (write-back)](#editing-the-copy-write-back) below. Both directions default to `true`; set either to `false`, or the whole block to `false`, to disable.
 - `oneway_google_calendars`: Optional - see [One-Way Mirror Calendars](#one-way-mirror-calendars) below. Omit or set to `[]` to disable.
 - `notify_url`: Optional - set to `null` or `""` to disable notifications
+
+#### Editing the Copy (write-back)
+
+Every event has an *owner*: the calendar it was created in. By default an edit made on the
+**copy** — renaming, rescheduling, or changing the recurrence of the mirrored version —
+is written back to the owner, so it does not silently disappear on the next sync:
+
+```json
+"sync_target_updates": {
+  "to_google": true,
+  "to_icloud": true
+}
+```
+
+- `to_google`: an event you created in **Google** but edited in **iCloud** is patched back
+  into Google.
+- `to_icloud`: an event you created in **iCloud** but edited in **Google** is written back
+  into the iCloud event.
+
+Set either to `false` (or the whole block to `false`) to make the owning calendar strictly
+authoritative and discard edits made on the copy.
+
+**Conflict rule:** if the same event is edited on *both* sides within one sync interval,
+the **Google-side edit wins** — the Google → iCloud pass runs first, and the losing edit is
+overwritten rather than bounced back and forth.
+
+Write-backs are reported separately in notifications, prefixed with `↩`.
+
+One-way mirrored calendars are **not** covered by this flag; they have their own per-calendar
+`writeback` opt-in (see below).
 
 #### One-Way Mirror Calendars
 
@@ -90,7 +126,7 @@ configurable title **prefix** so you can tell it apart from your regular events:
 ```json
 "oneway_google_calendars": [
   { "calendar_id": "team-calendar-id@group.calendar.google.com", "prefix": "[Team] " },
-  { "calendar_id": "another-id@group.calendar.google.com",       "prefix": "[Ops] " }
+  { "calendar_id": "another-id@group.calendar.google.com",       "prefix": "[Ops] ", "writeback": true }
 ]
 ```
 
@@ -101,10 +137,18 @@ configurable title **prefix** so you can tell it apart from your regular events:
   trailing space if you want one. The source event in Google is never modified, and the
   prefix never accumulates across syncs.
 
+- `writeback`: Optional, defaults to `false`. When `true`, an edit you make to the mirrored
+  copy in iCloud is patched back into **that source calendar** — never into your primary.
+  Leave it off for calendars shared with you read-only: the patch would be rejected. If that
+  happens anyway, the failure is reported once and then suppressed rather than retried every
+  cycle. Recurring mirrored events are never written back (the mirror stores a single
+  expanded occurrence, so a patch would edit just that one occurrence of the source series).
+
 **Guarantees:**
-- **One-way only.** These events flow Google → iCloud exclusively. They are **never**
-  written back to Google (not to the source calendar, your primary, or any other), and
-  they never interfere with the primary bidirectional sync.
+- **Never into your primary calendar.** These events flow Google → iCloud, and are **never**
+  added to your primary Google calendar or any calendar other than the one they came from.
+  Without `writeback`, they are never written back at all. They never interfere with the
+  primary bidirectional sync.
 - **Same iCloud calendar.** Mirrored events land in the calendar named by `calendar_name`,
   distinguished only by their prefix.
 - **Deletions propagate.** Removing an event from the source Google calendar removes its
@@ -236,10 +280,19 @@ docker-compose run --rm calendar-sync python reconcile.py --list-fanout
 This is **read-only** — it lists the leftover duplicate events (grouped by series) so you can
 delete them by hand in Google Calendar. The sync state self-heals afterward.
 
-### Known Limitation
+### Editing an Event on Either Side
 
-Editing an **iCloud-originated** event on the **Google** side is not propagated back to iCloud
-(iCloud is treated as the source of truth for those events). Edit such events in iCloud.
+Edits made on the *copy* of an event propagate back to the calendar that owns it, in both
+directions, and are reported in notifications with a `↩` prefix. This is on by default and
+controlled by [`sync_target_updates`](#editing-the-copy-write-back).
+
+If the same event is edited on both sides within one interval, the Google-side edit wins.
+
+Two things are still not synced, in either direction:
+- Editing or moving a **single occurrence** of a recurring series (deleting one occurrence
+  does propagate, as an `EXDATE`).
+- Fields beyond title, description, start, end and recurrence — location, attendees and
+  status are left alone on both sides.
 
 ## Notifications
 
@@ -265,9 +318,18 @@ Added 2 from Google:
   + Team Meeting (2025-10-15)
   + Doctor Appointment (2025-10-16)
 
+Updated 1 in iCloud:
+  ~ Standup (2025-10-14)
+
+Written back 1 to Google:
+  ↩ Dentist (2025-10-17)
+
 Deleted 1 from iCloud:
   - Old Event (2025-10-10)
 ```
+
+`+` added, `~` updated from its owning calendar, `↩` an edit you made on the copy pushed
+back to the calendar that owns the event, `-` deleted.
 
 ## Troubleshooting
 
