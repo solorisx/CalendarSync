@@ -155,7 +155,8 @@ configurable title **prefix** so you can tell it apart from your regular events:
   mirrored copy from iCloud on the next sync.
 
 > Note: because mirrored events exist only in iCloud (by design), the standalone
-> `reconcile.py` audit reports them under "iCloud only" — this is expected and harmless.
+> `reconcile.py` audit lists them under their own "Mirrored (ok)" heading rather than
+> counting them as drift.
 
 ### 5. Initial Authentication
 

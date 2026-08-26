@@ -29,6 +29,10 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import caldav
 
+# Reuse the sync engine's own derivations rather than re-deriving them here. Every
+# rule this file duplicated eventually drifted from the thing it was auditing.
+from sync_calendars import CalendarSync, ONEWAY_UID_RE
+
 # ---------------------------------------------------------------------------
 # Config / paths (same as sync_calendars.py)
 # ---------------------------------------------------------------------------
@@ -193,26 +197,31 @@ def fetch_icloud_events(icloud_calendar, start, end):
 # ---------------------------------------------------------------------------
 
 def normalise_dt(dt_val):
-    """Return an ISO string for comparison.
+    """Return an ISO string for comparison: a date, or an INSTANT in UTC.
 
-    Uses wall-clock time (stripping timezone info) so that Google's tz-aware
-    times (e.g. 19:00+02:00) and iCloud's naive times (e.g. 19:00:00, which
-    the sync wrote as UTC but iCloud returns without tz) compare as equal when
-    the wall-clock hour matches.
+    This used to compare wall-clock time with the timezone stripped off, on the
+    assumption that both sides display the same local hour. They do not: the sync
+    writes UTC into iCloud while Google keeps the event's original zone, so the same
+    moment comes back as 17:47+02:00 from one side and 15:47 from the other. Comparing
+    the hours therefore reported EVERY timed event outside UTC as drift — 64 of 73 on
+    a Swiss calendar — which is worse than useless in an audit.
 
-    Naive datetimes at midnight are treated as date-only (iCloud sometimes
-    returns all-day events as datetime(Y,M,D,0,0,0) instead of date(Y,M,D)).
+    Naive datetimes are iCloud's and are UTC by construction (that is what the sync
+    writes). Datetimes at exact midnight are still treated as date-only, since iCloud
+    sometimes returns an all-day event as datetime(Y,M,D,0,0,0) rather than date(Y,M,D).
     """
     if dt_val is None:
         return None
     if isinstance(dt_val, datetime):
-        # Strip timezone — compare wall-clock hours only.
-        # Both Google (tz-aware) and iCloud (naive, stored as UTC by sync but
-        # returned without tz) will show the same local/display time this way.
-        if dt_val.hour == 0 and dt_val.minute == 0 and dt_val.second == 0:
-            # Treat midnight as date-only (handles all-day events stored as datetime)
-            return dt_val.date().isoformat()
-        return dt_val.strftime('%Y-%m-%dT%H:%M:%S')
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=timezone.utc)
+        dt_utc = dt_val.astimezone(timezone.utc)
+        # Midnight is checked AFTER converting, so both sides of a comparison collapse
+        # together: an event ending 02:00+02:00 in Google is the same 00:00Z that iCloud
+        # stores naively, and checking before conversion collapsed only one of them.
+        if dt_utc.hour == 0 and dt_utc.minute == 0 and dt_utc.second == 0:
+            return dt_utc.date().isoformat()
+        return dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
     # date object
     return dt_val.isoformat()
 
@@ -252,36 +261,17 @@ def icloud_event_times(component):
 # ---------------------------------------------------------------------------
 
 def reconcile():
-    # Load config
-    if not os.path.exists(CONFIG_FILE):
-        logger.error(f"Config file not found: {CONFIG_FILE}")
-        sys.exit(1)
-    with open(CONFIG_FILE) as f:
-        config = json.load(f)
-    logger.debug(f"Loaded config from {CONFIG_FILE}")
-
-    # Load sync state
-    state = {}
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        logger.debug(f"Loaded sync state: {len(state.get('synced_events', {}))} entries")
-    else:
-        logger.warning(f"No sync state file found at {STATE_FILE}")
-
+    # Config, state and window all come from the sync engine itself. Reconcile used to
+    # keep its own copies; the window one silently ignored config.json's
+    # sync_past_days / sync_future_days, so any install that set them got false
+    # Google-only / iCloud-only diffs for the band the sync manages but this did not scan.
+    sync = CalendarSync()
+    config = sync.config
+    state = sync.state
     synced_events = state.get('synced_events', {})
+    logger.debug(f"Loaded config and sync state ({len(synced_events)} entries)")
 
-    # Time window — must match the sync engine's window exactly, otherwise reconcile
-    # reports false Google-only/iCloud-only diffs for the band the sync manages but
-    # reconcile doesn't scan. Same env defaults as sync_calendars (SYNC_PAST_DAYS /
-    # SYNC_FUTURE_DAYS). (Phase 5 will hoist these into a shared module.)
-    past_days = int(os.getenv('SYNC_PAST_DAYS', '1'))
-    future_days = int(os.getenv('SYNC_FUTURE_DAYS', '1825'))
-    now = datetime.now(timezone.utc)
-    start_dt = now - timedelta(days=past_days)
-    end_dt = now + timedelta(days=future_days)
-    time_min = start_dt.isoformat().replace('+00:00', 'Z')
-    time_max = end_dt.isoformat().replace('+00:00', 'Z')
+    now, start_dt, end_dt, time_min, time_max = sync._sync_window()
 
     logger.info("=" * 60)
     logger.info("Calendar Reconciliation")
@@ -295,36 +285,68 @@ def reconcile():
         google_service, config['google_calendar_id'], time_min, time_max
     )
 
-    # Index Google events by a normalised canonical UID so they match iCloud's bare UIDs.
-    # Google native events have iCalUID like "abc123@google.com"; iCloud stores them as "abc123".
-    # We use the bare UID as the canonical key and keep a separate alias map for lookups.
-    google_by_uid = {}       # canonical UID → event
-    google_uid_aliases = {}  # raw iCalUID → canonical UID (for reporting the original UID)
-
     def canonical_uid(uid):
-        uid = uid.lstrip('_')
+        """Google native events have iCalUID "abc123@google.com"; iCloud stores "abc123"."""
+        uid = str(uid).lstrip('_')
         if '@google.com' in uid:
             uid = uid.split('@google.com')[0]
         return uid
 
-    for ev in google_events_list:
-        raw_uid = ev.get('iCalUID', ev['id'])
-        canon = canonical_uid(raw_uid)
-        google_by_uid[canon] = ev
-        google_uid_aliases[raw_uid] = canon
-        logger.debug(f"  Google event: {ev.get('summary', 'No Title')!r}  iCalUID={raw_uid}  canonical={canon}")
-
-    logger.info(f"Google: {len(google_events_list)} events ({len(google_by_uid)} unique UIDs after normalisation)")
-
     # --- Fetch iCloud events ---
+    # iCloud is indexed FIRST because deriving the UID a Google event was written under
+    # needs to know what is actually in iCloud: the sync keeps a legacy spelling when it
+    # finds one already there.
     logger.info("Fetching iCloud Calendar events...")
     icloud_calendar = get_icloud_calendar(config)
     icloud_events_list = fetch_icloud_events(icloud_calendar, start_dt, end_dt)
 
-    icloud_by_uid = {}
+    icloud_raw = {}          # exact UID as stored in iCloud → component
+    icloud_by_uid = {}       # canonical UID → component
+    mirrored_only = []       # one-way mirrored copies — iCloud-only BY DESIGN
     for event_id, component in icloud_events_list:
+        icloud_raw[str(event_id)] = component
+        if ONEWAY_UID_RE.match(str(event_id)):
+            mirrored_only.append((str(event_id), component))
+            continue
         icloud_by_uid[canonical_uid(event_id)] = component
-    logger.info(f"iCloud: {len(icloud_events_list)} events ({len(icloud_by_uid)} unique UIDs)")
+    logger.info(f"iCloud: {len(icloud_events_list)} events "
+                f"({len(icloud_by_uid)} to compare, {len(mirrored_only)} one-way mirrored)")
+
+    # Index Google events under the UID the SYNC would give them in iCloud — NOT under
+    # their raw iCalUID. Those differ often: ids beginning '_' are stripped, ids over
+    # 200 chars are hashed, and an imported event's foreign iCalUID may have been
+    # adopted instead of the id. Re-deriving that here by hand is what made this tool
+    # report one event as BOTH "Google only" and "iCloud only"; calling the sync's own
+    # function means the two can never disagree again.
+    google_by_uid = {}
+    google_state_key = {}    # canonical UID → key this event has in sync state
+    for ev in google_events_list:
+        raw_uid = ev.get('iCalUID', ev['id'])
+        canon = canonical_uid(sync._icloud_uid_for_google_event(ev, icloud_raw))
+        google_by_uid[canon] = ev
+        for candidate in (ev['id'], raw_uid, canonical_uid(raw_uid), canon):
+            if candidate in synced_events:
+                google_state_key[canon] = candidate
+                break
+        logger.debug(f"  Google event: {ev.get('summary', 'No Title')!r}  "
+                     f"iCalUID={raw_uid}  iCloud UID={canon}")
+
+    logger.info(f"Google: {len(google_events_list)} events ({len(google_by_uid)} unique UIDs)")
+
+    def state_entry_for(uid):
+        """Find the sync-state entry for a canonical UID.
+
+        State is keyed by the Google event id for Google-origin events and by the
+        iCloud UID for iCloud-origin ones, so the canonical UID is frequently neither."""
+        if uid in synced_events:
+            return uid, synced_events[uid]
+        key = google_state_key.get(uid)
+        if key:
+            return key, synced_events[key]
+        for k, e in synced_events.items():
+            if e.get('icloud_uid') and canonical_uid(e['icloud_uid']) == uid:
+                return k, e
+        return None, None
 
     # ---------------------------------------------------------------------------
     # Analysis
@@ -398,7 +420,7 @@ def reconcile():
         i_end_raw = str(i_comp.get('dtend').dt) if i_comp.get('dtend') else ''
         logger.debug(f"      Google  title={g_title!r}  start={g_start}(raw:{g_start_raw})  end={g_end}(raw:{g_end_raw})  desc={g_desc[:80]!r}")
         logger.debug(f"      iCloud  title={i_title!r}  start={i_start}(raw:{i_start_raw})  end={i_end}(raw:{i_end_raw})  desc={i_desc[:80]!r}")
-        state_entry = synced_events.get(uid)
+        _, state_entry = state_entry_for(uid)
         if state_entry:
             logger.debug(f"      sync_state: source={state_entry.get('source')} "
                          f"synced_at={state_entry.get('synced_at')} "
@@ -410,9 +432,9 @@ def reconcile():
     for uid in only_in_google:
         g_ev = google_by_uid[uid]
         g_start, _ = google_event_times(g_ev)
-        state_entry = synced_events.get(uid)
+        state_key, state_entry = state_entry_for(uid)
         state_info = (
-            f"source={state_entry.get('source')} synced_at={state_entry.get('synced_at')}"
+            f"source={state_entry.get('source')} synced_at={state_entry.get('synced_at')} key={state_key}"
             if state_entry else "NOT in sync state"
         )
         logger.warning(f"  → {g_ev.get('summary', 'No Title')!r}  start={g_start}")
@@ -424,14 +446,19 @@ def reconcile():
         i_comp = icloud_by_uid[uid]
         i_start, _ = icloud_event_times(i_comp)
         i_title = str(i_comp.get('summary', 'No Title'))
-        state_entry = synced_events.get(uid)
+        state_key, state_entry = state_entry_for(uid)
         state_info = (
-            f"source={state_entry.get('source')} synced_at={state_entry.get('synced_at')}"
+            f"source={state_entry.get('source')} synced_at={state_entry.get('synced_at')} key={state_key}"
             if state_entry else "NOT in sync state"
         )
         logger.warning(f"  ← {i_title!r}  start={i_start}")
         logger.debug(f"      UID: {uid}")
         logger.debug(f"      sync_state: {state_info}")
+
+    logger.info(f"\n[MIRRORED] One-way copies, iCloud-only by design: {len(mirrored_only)}")
+    for uid, i_comp in mirrored_only:
+        i_start, _ = icloud_event_times(i_comp)
+        logger.debug(f"  ⇢ {str(i_comp.get('summary', 'No Title'))!r}  start={i_start}  UID: {uid}")
 
     # --- Summary ---
     logger.info("\n" + "=" * 60)
@@ -440,6 +467,7 @@ def reconcile():
     logger.info(f"  Mismatched:      {len(in_both_mismatch)}")
     logger.info(f"  Google only:     {len(only_in_google)}")
     logger.info(f"  iCloud only:     {len(only_in_icloud)}")
+    logger.info(f"  Mirrored (ok):   {len(mirrored_only)}")
     logger.info("=" * 60)
 
     return {
@@ -449,6 +477,10 @@ def reconcile():
         'in_both_mismatch': in_both_mismatch,
         'google_by_uid': google_by_uid,
         'icloud_by_uid': icloud_by_uid,
+        'mirrored_only': mirrored_only,
+        'state_keys': {uid: state_entry_for(uid)[0]
+                       for uid in list(only_in_google) + list(only_in_icloud)
+                       if state_entry_for(uid)[0]},
         'synced_events': synced_events,
         'state': state,
     }
@@ -468,32 +500,31 @@ def resync_orphans(results):
     google_by_uid = results['google_by_uid']
     icloud_by_uid = results['icloud_by_uid']
 
+    # The state key is not the canonical UID for most events (Google-origin entries are
+    # keyed by the Google event id), so look it up rather than assuming they match —
+    # assuming it meant these orphans were never offered, and a 'del' would have missed.
+    state_keys = results.get('state_keys', {})
+
     # iCloud-only events that are in sync state — removing the state entry will
     # cause sync_icloud_to_google to push them to Google again.
-    icloud_orphans = [
-        uid for uid in results['only_in_icloud']
-        if uid in synced_events
-    ]
+    icloud_orphans = [uid for uid in results['only_in_icloud'] if state_keys.get(uid)]
 
     # Google-only events that are in sync state — removing the state entry will
     # cause sync_google_to_icloud to push them to iCloud again.
-    google_orphans = [
-        uid for uid in results['only_in_google']
-        if uid in synced_events
-    ]
+    google_orphans = [uid for uid in results['only_in_google'] if state_keys.get(uid)]
 
     candidates = []
     for uid in icloud_orphans:
-        entry = synced_events[uid]
+        key = state_keys[uid]
         i_comp = icloud_by_uid[uid]
         i_start, _ = icloud_event_times(i_comp)
-        candidates.append((uid, entry, 'icloud-only (missing from Google)', i_start))
+        candidates.append((key, synced_events[key], 'icloud-only (missing from Google)', i_start))
 
     for uid in google_orphans:
-        entry = synced_events[uid]
+        key = state_keys[uid]
         g_ev = google_by_uid[uid]
         g_start, _ = google_event_times(g_ev)
-        candidates.append((uid, entry, 'google-only (missing from iCloud)', g_start))
+        candidates.append((key, synced_events[key], 'google-only (missing from iCloud)', g_start))
 
     if not candidates:
         logger.info("No orphans with sync state entries found — nothing to resync.")
