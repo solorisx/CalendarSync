@@ -179,6 +179,43 @@ class CalendarSync:
             end_dt = end_dt.astimezone(timezone.utc)
         return start_dt, end_dt
 
+    @staticmethod
+    def _apply_google_recurrence(component, recurrence_list):
+        """Copy Google's ``recurrence[]`` content-lines (RRULE/RDATE/EXDATE, already valid
+        ICS property lines) onto an icalendar VEVENT, preserving params like TZID by
+        round-tripping them through the parser. This is how a recurring Google master is
+        written to iCloud as a real recurring VEVENT instead of expanded copies."""
+        if not recurrence_list:
+            return
+        stub = ("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:stub\r\n"
+                + "\r\n".join(recurrence_list) + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+        parsed = Calendar.from_ical(stub)
+        for sub in parsed.walk('VEVENT'):
+            for k in ('RRULE', 'RDATE', 'EXDATE'):
+                if k in sub:
+                    component.pop(k, None)
+                    component.add(k, sub[k])
+
+    @staticmethod
+    def _extract_ical_recurrence(component):
+        """Serialize a VEVENT's rrule/rdate/exdate back into Google ``recurrence[]`` strings
+        (with TZID params preserved). This is how a recurring iCloud master is written to
+        Google as a real series."""
+        out = []
+        for k in ('RRULE', 'RDATE', 'EXDATE'):
+            if k not in component:
+                continue
+            props = component[k]
+            if not isinstance(props, list):
+                props = [props]
+            for p in props:
+                val = p.to_ical()
+                if isinstance(val, (bytes, bytearray)):
+                    val = val.decode('utf-8')
+                tzid = getattr(p, 'params', {}).get('TZID')
+                out.append(f"{k}{';TZID=' + str(tzid) if tzid else ''}:{val}")
+        return out
+
     def load_state(self):
         """Load sync state"""
         default = {'last_sync': None, 'synced_events': {}, 'last_error': None, 'last_notification_sent': None}

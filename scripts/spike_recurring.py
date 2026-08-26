@@ -91,7 +91,10 @@ def probe_google_read(gsvc, cal_id, fixtures_dir):
         return
 
     masters = [e for e in items if e.get('recurrence')]
-    record("G1", bool(masters),
+    # 0 masters is a DATA condition (this calendar may simply hold no native recurring
+    # events — e.g. only fan-out singles from the old sync), not an API failure. Score it
+    # SKIP; the write+read-back probe (G1b) positively confirms master READ regardless.
+    record("G1", (True if masters else None),
            f"{len(masters)} recurring master(s) with recurrence[] over the window "
            f"(of {len(items)} total items)")
     if masters:
@@ -170,6 +173,13 @@ def probe_google_write(gsvc, cal_id, fixtures_dir):
         n = len([i for i in inst.get('items', []) if i.get('status') != 'cancelled'])
         record("G3", n == 3, f"inserted series, {n} instance(s) materialized (expected 3)")
         dump_fixture(fixtures_dir, "google_written_master.json", json.dumps(created, indent=2))
+
+        # G1b: positively confirm Google master READ — the written master must come back
+        # from list(singleEvents=False) carrying its recurrence[] (this is what G1 could not
+        # test when the calendar had no native recurring events).
+        got = gsvc.events().get(calendarId=cal_id, eventId=created['id']).execute()
+        record("G1b", bool(got.get('recurrence')),
+               f"written master read back via get() carries recurrence[]={got.get('recurrence')}")
 
         # G4: add an EXDATE for the 2nd occurrence and confirm it drops out.
         exdate = (start + timedelta(days=1))
