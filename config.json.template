@@ -6,10 +6,15 @@
     "password": "app-specific-password",
     "calendar_name": null
   },
+  "sync_target_updates": {
+    "to_google": true,
+    "to_icloud": true
+  },
   "oneway_google_calendars": [
     {
       "calendar_id": "team-calendar-id@group.calendar.google.com",
-      "prefix": "[Team] "
+      "prefix": "[Team] ",
+      "writeback": false
     }
   ],
   "notify_url": "https://ntfy.sh/your-channel",

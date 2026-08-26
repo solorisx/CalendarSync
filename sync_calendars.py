@@ -92,13 +92,23 @@ else:
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('googleapiclient').setLevel(logging.WARNING)
 
-def retry(fn, retries=3, delay=5, backoff=2):
-    """Call fn(), retrying on exception with exponential backoff."""
+def _is_permanent_http_error(exc):
+    """True for HTTP failures that retrying can never fix: a read-only calendar
+    (403), a missing event (404/410), a rejected body (400)."""
+    status = getattr(getattr(exc, 'resp', None), 'status', None)
+    return status in (400, 401, 403, 404, 410)
+
+
+def retry(fn, retries=3, delay=5, backoff=2, give_up=None):
+    """Call fn(), retrying on exception with exponential backoff.
+
+    give_up(exc) -> True marks an error as permanent and re-raises it at once
+    instead of sleeping through retries that cannot succeed."""
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
-            if attempt == retries - 1:
+            if attempt == retries - 1 or (give_up is not None and give_up(e)):
                 raise
             wait = delay * (backoff ** attempt)
             logger.warning(f"Request failed ({e}), retrying in {wait}s (attempt {attempt + 1}/{retries})...")
@@ -192,6 +202,61 @@ class CalendarSync:
         time_min = start_dt.isoformat().replace('+00:00', 'Z')
         time_max = end_dt.isoformat().replace('+00:00', 'Z')
         return now, start_dt, end_dt, time_min, time_max
+
+    def _target_updates_enabled(self, direction):
+        """Is write-back of edits made on the TARGET side enabled?
+
+        direction is 'to_google' (a Google-origin event edited in iCloud is patched
+        back into Google) or 'to_icloud' (an iCloud-origin event edited in Google is
+        written back into the iCloud event). Both default on; a bare bool is accepted
+        as shorthand for the whole block. One-way mirrored calendars are governed
+        separately by a per-calendar 'writeback' key, since most of them are
+        read-only shares."""
+        cfg = self.config.get('sync_target_updates', True)
+        if isinstance(cfg, bool):
+            return cfg
+        return bool((cfg or {}).get(direction, True))
+
+    @staticmethod
+    def _refresh_entry_times(entry, start, end, title):
+        """Keep a state entry's cached start/end/title in step with a write.
+
+        Update paths used to leave the ORIGINAL times in state. That is not cosmetic:
+        _cleanup_past_events and both deletion-window gates read these fields, so a
+        rescheduled event could be pruned as 'past' and then re-created as a duplicate.
+        Write-back makes reschedules routine, so every update path refreshes them."""
+        if start:
+            entry['start'] = start
+        if end:
+            entry['end'] = end
+        if title is not None:
+            entry['title'] = title
+
+    @classmethod
+    def _apply_google_fields_to_vevent(cls, component, event, summary=None, recurrence=None):
+        """Overwrite a VEVENT's synced fields from a Google event, in place.
+
+        Only the fields this app syncs are touched — everything else the VEVENT
+        carries (VALARM, attendees, custom properties) is deliberately preserved.
+        Pass recurrence=None to leave RRULE/RDATE/EXDATE alone (the one-way mirror
+        writes expanded single events and must not grow a recurrence)."""
+        component.pop('summary', None)
+        component.add('summary', summary if summary is not None else event.get('summary', 'No Title'))
+        if event.get('description'):
+            component.pop('description', None)
+            component.add('description', event['description'])
+        elif 'description' in component:
+            del component['description']
+        ev_start, ev_end = cls._google_start_end(event)
+        component.pop('dtstart', None)
+        component.pop('dtend', None)
+        component.add('dtstart', ev_start)
+        component.add('dtend', ev_end)
+        if recurrence is not None:
+            component.pop('rrule', None)
+            component.pop('rdate', None)
+            component.pop('exdate', None)
+            cls._apply_google_recurrence(component, recurrence)
 
     @staticmethod
     def _google_start_end(event):
@@ -689,7 +754,60 @@ class CalendarSync:
                 ical_uid and self.state['synced_events'].get(ical_uid, {}).get('source') == 'icloud'
             )
             if is_icloud_origin:
-                logger.debug(f"  Skipping: Event originated from iCloud (found in sync state as icloud source)")
+                # iCloud owns this event's content. When write-back is enabled, an edit
+                # made HERE (on the Google copy) is still propagated home to iCloud —
+                # otherwise it is silently dropped, which is the old known limitation.
+                if not self._target_updates_enabled('to_icloud'):
+                    logger.debug(f"  Skipping: Event originated from iCloud (write-back to iCloud disabled)")
+                    continue
+                entry = self.state['synced_events'][ical_uid]
+                if entry.get('sync_failed') or entry.get('legacy_fanout'):
+                    continue
+                last_modified = event.get('updated')
+                baseline = entry.get('last_modified_google')
+                if baseline is None:
+                    # No Google-side baseline yet for this iCloud-origin event (every
+                    # entry written before this feature). Capture and do not propagate.
+                    entry['last_modified_google'] = last_modified
+                    logger.debug(f"  Captured Google baseline for iCloud-origin '{event_title}' (no propagation)")
+                    continue
+                if not last_modified or _same_instant(last_modified, baseline):
+                    logger.debug(f"  Skipping: iCloud-origin event unchanged in Google")
+                    continue
+                # The state key IS the iCloud UID for iCloud-origin events.
+                icloud_event = (
+                    existing_icloud_events.get(ical_uid)
+                    or existing_icloud_events.get(self._sanitize_icloud_uid(ical_uid))
+                )
+                if icloud_event is None:
+                    logger.warning(f"  Google edit to '{event_title}' not written back: event not found in iCloud window")
+                    continue
+                try:
+                    cal = Calendar.from_ical(icloud_event.data)
+                    for component in cal.walk():
+                        if component.name == "VEVENT":
+                            self._apply_google_fields_to_vevent(
+                                component, event, recurrence=_recurrence_for(event)
+                            )
+                            break
+                    icloud_event.data = cal.to_ical()
+                    icloud_event.save()
+                    entry['last_modified_google'] = last_modified
+                    entry['last_modified'] = last_modified
+                    # Our write may bump iCloud's LAST-MODIFIED; invalidate that baseline
+                    # so the reverse pass re-captures instead of bouncing it back.
+                    entry['last_modified_icloud'] = None
+                    entry.pop('icloud_lm_absent', None)
+                    event_start = event['start'].get('dateTime', event['start'].get('date'))
+                    self._refresh_entry_times(
+                        entry, event_start, _google_event_end(event), event.get('summary')
+                    )
+                    updated_count += 1
+                    updated_events.append({'title': event.get('summary'), 'start': event_start})
+                    logger.info(f"Written back to iCloud: {event_title}")
+                except Exception as e:
+                    logger.error(f"Failed to write '{event_title}' back to iCloud: {e}")
+                    error_count += 1
                 continue
 
             if event_uid in self.state['synced_events'] and not self.state['synced_events'][event_uid].get('sync_failed'):
@@ -724,35 +842,28 @@ class CalendarSync:
                             cal = Calendar.from_ical(icloud_event.data)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    component.pop('summary', None)
-                                    component.add('summary', event.get('summary', 'No Title'))
-                                    if event.get('description'):
-                                        component.pop('description', None)
-                                        component.add('description', event['description'])
-                                    elif 'description' in component:
-                                        del component['description']
-                                    ev_start, ev_end = self._google_start_end(event)
-                                    component.pop('dtstart', None)
-                                    component.pop('dtend', None)
-                                    component.add('dtstart', ev_start)
-                                    component.add('dtend', ev_end)
                                     # Refresh recurrence too (RRULE/EXDATE may have changed).
-                                    component.pop('rrule', None)
-                                    component.pop('rdate', None)
-                                    component.pop('exdate', None)
-                                    self._apply_google_recurrence(component, _recurrence_for(event))
+                                    self._apply_google_fields_to_vevent(
+                                        component, event, recurrence=_recurrence_for(event)
+                                    )
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
                             self.state['synced_events'][event_uid]['last_modified_google'] = last_modified
                             self.state['synced_events'][event_uid]['last_modified'] = last_modified
-                            self.state['synced_events'][event_uid]['title'] = event.get('summary')
+                            self._refresh_entry_times(
+                                self.state['synced_events'][event_uid],
+                                event['start'].get('dateTime', event['start'].get('date')),
+                                _google_event_end(event),
+                                event.get('summary'),
+                            )
                             self.state['synced_events'][event_uid]['recurrence_sig'] = cur_rec_sig
                             # Our own write may bump iCloud's LAST-MODIFIED. Invalidate
                             # the iCloud baseline so the reverse pass re-captures the
                             # post-write timestamp instead of mistaking it for a user
                             # edit and bouncing the change back (ping-pong).
                             self.state['synced_events'][event_uid]['last_modified_icloud'] = None
+                            self.state['synced_events'][event_uid].pop('icloud_lm_absent', None)
                             updated_count += 1
                             event_start = event['start'].get('dateTime', event['start'].get('date'))
                             updated_events.append({'title': event.get('summary'), 'start': event_start})
@@ -932,6 +1043,8 @@ class CalendarSync:
             'added_events': added_events,
             'updated_events': updated_events,
             'deleted_events': deleted_events,
+            'writeback': 0,
+            'writeback_events': [],
             'errors': error_count
         }
 
@@ -974,7 +1087,8 @@ class CalendarSync:
             return {
                 'added': synced_count, 'updated': updated_count, 'deleted': deleted_count,
                 'added_events': added_events, 'updated_events': updated_events,
-                'deleted_events': deleted_events, 'errors': error_count,
+                'deleted_events': deleted_events, 'writeback': 0,
+                'writeback_events': [], 'errors': error_count,
             }
 
         logger.info(f"→ One-way mirroring {len(oneway_calendars)} additional Google calendar(s) → iCloud...")
@@ -1057,11 +1171,18 @@ class CalendarSync:
                 prefixed_title = f"{prefix}{base_title}"
                 event_start = event['start'].get('dateTime', event['start'].get('date'))
                 event_end = _google_event_end(event)
+                # This pass expands series (singleEvents=True) and mirrors ONE
+                # representative per series, so the id recorded here is an occurrence
+                # id. Flag it: write-back must refuse those rather than silently edit a
+                # single occurrence of the source series. Refreshed every pass so
+                # entries written before this existed heal themselves.
+                is_recurring = bool(event.get('recurringEventId'))
 
                 # Already mirrored: update only if Google's timestamp changed
                 if state_key in self.state['synced_events'] and not self.state['synced_events'][state_key].get('sync_failed'):
                     last_modified = event.get('updated')
                     stored_state = self.state['synced_events'][state_key]
+                    stored_state['oneway_recurring'] = is_recurring
                     stored_modified = stored_state.get('last_modified_google') or stored_state.get('last_modified') or stored_state.get('synced_at')
                     if last_modified and stored_modified and last_modified != stored_modified and safe_uid in existing_icloud_events:
                         try:
@@ -1069,27 +1190,25 @@ class CalendarSync:
                             cal = Calendar.from_ical(icloud_event.data)
                             for component in cal.walk():
                                 if component.name == "VEVENT":
-                                    component.pop('summary', None)
-                                    component.add('summary', prefixed_title)
-                                    if event.get('description'):
-                                        component.pop('description', None)
-                                        component.add('description', event['description'])
-                                    elif 'description' in component:
-                                        del component['description']
-                                    start = event['start'].get('dateTime', event['start'].get('date'))
-                                    end = event['end'].get('dateTime', event['end'].get('date'))
-                                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                                    end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
-                                    component.pop('dtstart', None)
-                                    component.pop('dtend', None)
-                                    component.add('dtstart', start_dt)
-                                    component.add('dtend', end_dt)
+                                    # No recurrence: the mirror writes expanded single events.
+                                    self._apply_google_fields_to_vevent(
+                                        component, event, summary=prefixed_title
+                                    )
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
                             self.state['synced_events'][state_key]['last_modified_google'] = last_modified
                             self.state['synced_events'][state_key]['last_modified'] = last_modified
-                            self.state['synced_events'][state_key]['title'] = prefixed_title
+                            # Our own write may bump iCloud's LAST-MODIFIED. Invalidate the
+                            # iCloud baseline so the reverse pass re-captures it instead of
+                            # mistaking it for a user edit and writing it straight back —
+                            # which, with mirror write-back enabled, loops forever.
+                            self.state['synced_events'][state_key]['last_modified_icloud'] = None
+                            self.state['synced_events'][state_key].pop('icloud_lm_absent', None)
+                            self._refresh_entry_times(
+                                self.state['synced_events'][state_key],
+                                event_start, event_end, prefixed_title,
+                            )
                             updated_count += 1
                             updated_events.append({'title': prefixed_title, 'start': event_start})
                             logger.info(f"  Updated in iCloud (mirror): {prefixed_title}")
@@ -1105,6 +1224,7 @@ class CalendarSync:
                         last_modified_google=event.get('updated'),
                         source_calendar_id=calendar_id
                     )
+                    self.state['synced_events'][state_key]['oneway_recurring'] = is_recurring
                     continue
 
                 # Create the mirrored iCloud event (prefixed title is the only difference)
@@ -1142,6 +1262,7 @@ class CalendarSync:
                         icloud_uid=safe_uid, last_modified_google=event.get('updated'),
                         source_calendar_id=calendar_id
                     )
+                    self.state['synced_events'][state_key]['oneway_recurring'] = is_recurring
                     synced_count += 1
                     added_events.append({'title': prefixed_title, 'start': event_start})
                     logger.info(f"  Added to iCloud (mirror): {prefixed_title}")
@@ -1208,8 +1329,153 @@ class CalendarSync:
             'added_events': added_events,
             'updated_events': updated_events,
             'deleted_events': deleted_events,
+            'writeback': 0,
+            'writeback_events': [],
             'errors': error_count
         }
+
+    def _writeback_to_google(self, google_service, component, icloud_uid, state_key, entry,
+                             last_modified, recurrence_lines, oneway_writeback, counters):
+        """Push an edit made on the iCloud COPY of a Google-origin event back to Google.
+
+        Patches the event in the calendar that actually owns it: the primary calendar for
+        source='google', and its own source calendar for a one-way mirrored event — never
+        the primary, and never as a new event. Follows the same baseline contract as every
+        other propagation path: compare iCloud's timestamp only against the stored iCloud
+        baseline, then invalidate the Google baseline so the forward pass re-captures the
+        post-write timestamp instead of bouncing the change back."""
+        title = str(component.get('summary', 'No Title'))
+        source = entry.get('source')
+
+        if entry.get('sync_failed') or entry.get('legacy_fanout'):
+            return
+        if not self._target_updates_enabled('to_google'):
+            logger.debug(f"  Skipping write-back (disabled): {title}")
+            return
+
+        if source == 'google_oneway':
+            calendar_id = entry.get('source_calendar_id')
+            if not calendar_id:
+                return
+            if not oneway_writeback.get(calendar_id):
+                logger.debug(f"  Skipping mirror write-back (not enabled for {calendar_id}): {title}")
+                return
+            if entry.get('oneway_recurring'):
+                # The mirror stores an EXPANDED instance id, so a patch would silently
+                # edit one occurrence of the source series. Refuse rather than surprise.
+                logger.debug(f"  Skipping mirror write-back of a recurring event: {title}")
+                return
+            key_prefix = f"ow:{calendar_id}:"
+            if not state_key.startswith(key_prefix):
+                return
+            google_event_id = state_key[len(key_prefix):]
+            target_label = calendar_id
+        else:
+            calendar_id = self.config['google_calendar_id']
+            # For a primary Google-origin event the state key IS the Google event id.
+            google_event_id = state_key
+            target_label = 'Google'
+        if not google_event_id:
+            return
+
+        baseline = entry.get('last_modified_icloud')
+        # iCloud does not stamp LAST-MODIFIED on the events we write, so "no baseline"
+        # and "baseline is legitimately absent" both look like None. Record which one it
+        # is: a timestamp APPEARING where we confirmed there was none is a user edit,
+        # not our own write, and swallowing it would eat the first edit to most events.
+        captured = baseline is not None or entry.get('icloud_lm_absent') is not None
+        if not captured:
+            # First iCloud-side baseline for this event (just mirrored, or a legacy
+            # entry). Capture it and do NOT propagate — that is the ping-pong guard.
+            entry['last_modified_icloud'] = last_modified
+            entry['icloud_lm_absent'] = last_modified is None
+            logger.debug(f"  Captured iCloud baseline for Google-origin '{title}' (no propagation)")
+            return
+        if entry.get('writeback_denied'):
+            # Read-only calendar: keep the baseline moving so we do not re-report it
+            # every cycle, but do not keep hammering a patch that cannot succeed.
+            entry['last_modified_icloud'] = last_modified
+            entry['icloud_lm_absent'] = last_modified is None
+            return
+        if not last_modified:
+            return
+        if baseline is not None and _same_instant(last_modified, baseline):
+            return
+
+        # The mirror writes prefixed titles into iCloud; strip the prefix before
+        # patching or it compounds on every edit.
+        summary = title
+        if source == 'google_oneway':
+            for cfg_entry in (self.config.get('oneway_google_calendars', []) or []):
+                prefix = cfg_entry.get('prefix') or ''
+                if cfg_entry.get('calendar_id') == calendar_id and prefix and summary.startswith(prefix):
+                    summary = summary[len(prefix):]
+                    break
+
+        dtstart = component.get('dtstart').dt
+        dtend_prop = component.get('dtend')
+        if dtend_prop is not None:
+            dtend = dtend_prop.dt
+        else:
+            # DTEND is optional; a VEVENT may carry DURATION instead (same fallback
+            # order as _icloud_component_end).
+            duration = component.get('duration')
+            dtend = dtstart + duration.dt if duration is not None else dtstart
+        if isinstance(dtstart, datetime):
+            start_dict = {'dateTime': dtstart.isoformat(), 'timeZone': 'UTC'}
+            end_dict = {'dateTime': dtend.isoformat(), 'timeZone': 'UTC'}
+        else:
+            start_dict = {'date': dtstart.isoformat()}
+            end_dict = {'date': dtend.isoformat()}
+        patch_body = {'summary': summary, 'start': start_dict, 'end': end_dict}
+        if component.get('description'):
+            patch_body['description'] = str(component.get('description'))
+        if recurrence_lines:
+            patch_body['recurrence'] = recurrence_lines
+
+        event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
+        try:
+            patched = retry(lambda: google_service.events().patch(
+                calendarId=calendar_id,
+                eventId=google_event_id,
+                body=patch_body
+            ).execute(), give_up=_is_permanent_http_error)
+        except Exception as e:
+            status = getattr(getattr(e, 'resp', None), 'status', None)
+            if status in (403, 401):
+                # Read-only shared calendar. Report once, then stay quiet.
+                entry['writeback_denied'] = True
+                entry['last_modified_icloud'] = last_modified
+                logger.error(f"  Write-back to '{target_label}' denied for '{summary}' (calendar is read-only)")
+                counters['errors'] += 1
+            elif status in (404, 410):
+                # Source event is gone; the owning direction's deletion sweep cleans up.
+                logger.warning(f"  Write-back target no longer exists in '{target_label}': {summary}")
+            else:
+                logger.error(f"  Failed to write '{summary}' back to '{target_label}': {e}")
+                counters['errors'] += 1
+            return
+
+        entry['last_modified_icloud'] = last_modified
+        entry['icloud_lm_absent'] = last_modified is None
+        entry['last_modified'] = last_modified
+        # Our patch bumps Google's `updated`. Adopt the post-write timestamp straight
+        # from the response as the new Google baseline, so neither the forward pass nor
+        # the mirror reads our own write as a Google-side edit. Falling back to None
+        # makes the next pass re-capture it instead — a cycle later, same outcome.
+        entry['last_modified_google'] = (patched or {}).get('updated')
+        if recurrence_lines:
+            # Keep the recurrence signature in step, or the forward pass sees a phantom
+            # recurrence change and emits a spurious "updated in iCloud".
+            entry['recurrence_sig'] = sorted(recurrence_lines)
+        self._refresh_entry_times(
+            entry, event_start, _icloud_component_end(component, event_start), title
+        )
+        counters['writeback'] += 1
+        counters['writeback_events'].append(
+            {'title': summary, 'start': event_start, 'target': target_label}
+        )
+        logger.info(f"Written back to {target_label}: {summary}")
 
     def sync_icloud_to_google(self, google_service, icloud_calendar):
         """Sync events from iCloud to Google Calendar"""
@@ -1226,16 +1492,29 @@ class CalendarSync:
         added_events = []
         updated_events = []
         deleted_events = []
+        # Mutable tally shared with _writeback_to_google (edits made on the iCloud copy
+        # of a Google-origin event, pushed back to whichever Google calendar owns it).
+        counters = {'writeback': 0, 'writeback_events': [], 'errors': 0}
 
         # Track current iCloud event UIDs
         current_icloud_ids = set()
 
         # Build an index of iCloud UIDs that were written by us from Google-origin events
-        # (including hashed UIDs). Used to prevent iCloud→Google ping-pong.
-        google_origin_icloud_uids = {
-            entry['icloud_uid']
-            for entry in self.state['synced_events'].values()
+        # (including hashed UIDs), mapped back to their state key. Used to prevent
+        # iCloud→Google ping-pong, and to locate the Google event to patch when an edit
+        # made on the iCloud copy has to be written back. The state key is NOT always the
+        # iCloud UID (Google ids starting with '_' are stripped, long ones hashed, and a
+        # foreign iCalUID may have been adopted), which is why this reverse map exists.
+        google_origin_by_icloud_uid = {
+            entry['icloud_uid']: (state_key, entry)
+            for state_key, entry in self.state['synced_events'].items()
             if entry.get('source') in ('google', 'google_oneway') and entry.get('icloud_uid')
+        }
+        google_origin_icloud_uids = set(google_origin_by_icloud_uid)
+        # Per-calendar write-back opt-in for one-way mirrored calendars.
+        oneway_writeback = {
+            entry.get('calendar_id'): bool(entry.get('writeback'))
+            for entry in (self.config.get('oneway_google_calendars', []) or [])
         }
 
         # Get existing Google events to check for duplicates
@@ -1308,6 +1587,27 @@ class CalendarSync:
                     # Get iCloud last-modified timestamp
                     last_modified_prop = component.get('last-modified')
                     last_modified = last_modified_prop.dt.isoformat() if last_modified_prop and hasattr(last_modified_prop.dt, 'isoformat') else None
+
+                    # Resolve which side this event originated on BEFORE the generic
+                    # update branch. A Google-origin event whose iCloud UID happens to
+                    # equal its state key used to fall into that branch by accident and
+                    # be written back unconditionally, while the same edit on an event
+                    # with a rewritten UID was silently dropped. Both now take the
+                    # explicit, flag-gated write-back path below.
+                    wb_key, wb_entry = None, None
+                    if event_id in self.state['synced_events']:
+                        entry = self.state['synced_events'][event_id]
+                        if entry.get('source') in ('google', 'google_oneway'):
+                            wb_key, wb_entry = event_id, entry
+                    elif event_id in google_origin_by_icloud_uid:
+                        wb_key, wb_entry = google_origin_by_icloud_uid[event_id]
+
+                    if wb_entry is not None:
+                        self._writeback_to_google(
+                            google_service, component, event_id, wb_key, wb_entry,
+                            last_modified, recurrence_lines, oneway_writeback, counters,
+                        )
+                        continue
 
                     if event_id in self.state['synced_events']:
                         # Propagate only if iCloud's OWN timestamp advanced past the
@@ -1587,6 +1887,8 @@ class CalendarSync:
 
         if updated_count > 0:
             logger.info(f"Updated {updated_count} event(s) in Google")
+        if counters['writeback'] > 0:
+            logger.info(f"Wrote back {counters['writeback']} iCloud edit(s) to Google")
         if deleted_count > 0:
             logger.info(f"Deleted {deleted_count} event(s) from Google")
 
@@ -1597,7 +1899,9 @@ class CalendarSync:
             'added_events': added_events,
             'updated_events': updated_events,
             'deleted_events': deleted_events,
-            'errors': error_count
+            'writeback': counters['writeback'],
+            'writeback_events': counters['writeback_events'],
+            'errors': error_count + counters['errors']
         }
 
     def run_reconcile(self):
@@ -1692,6 +1996,9 @@ class CalendarSync:
 
             total_added = google_result['added'] + icloud_result['added'] + oneway_result['added']
             total_updated = google_result.get('updated', 0) + icloud_result.get('updated', 0) + oneway_result.get('updated', 0)
+            # Edits made on the iCloud copy and pushed back to the calendar that owns them.
+            total_writeback = icloud_result.get('writeback', 0)
+            total_updated += total_writeback
             total_deleted = google_result['deleted'] + icloud_result['deleted'] + oneway_result['deleted']
             total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0) + oneway_result.get('errors', 0)
 
@@ -1707,6 +2014,8 @@ class CalendarSync:
             message = f"Sync complete: {google_result['added']} added from Google, {icloud_result['added']} added from iCloud, {google_result.get('updated', 0)} updated in iCloud, {icloud_result.get('updated', 0)} updated in Google, {google_result['deleted']} deleted from iCloud, {icloud_result['deleted']} deleted from Google"
             if oneway_result['added'] or oneway_result.get('updated', 0) or oneway_result['deleted']:
                 message += f", mirror: {oneway_result['added']} added / {oneway_result.get('updated', 0)} updated / {oneway_result['deleted']} deleted in iCloud"
+            if total_writeback:
+                message += f", {total_writeback} written back to Google"
             message += f", {total_errors} errors occurred in {time_str}"
             logger.info(message)
 
@@ -1749,6 +2058,21 @@ class CalendarSync:
                         notification_parts.append(f"  ~ {evt['title']} ({date_str})")
                     if icloud_result['updated'] > 5:
                         notification_parts.append(f"  ... and {icloud_result['updated'] - 5} more")
+
+                # Edits made on the iCloud copy of a Google-owned event, written back to
+                # the calendar that owns it. Kept separate from "Updated in Google" above,
+                # which is about iCloud-owned events, so the direction stays readable.
+                if icloud_result.get('writeback', 0) > 0:
+                    by_target = {}
+                    for evt in icloud_result['writeback_events']:
+                        by_target.setdefault(evt.get('target', 'Google'), []).append(evt)
+                    for target, evts in by_target.items():
+                        notification_parts.append(f"Written back {len(evts)} to {target}:")
+                        for evt in evts[:5]:
+                            date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
+                            notification_parts.append(f"  \u21a9 {evt['title']} ({date_str})")
+                        if len(evts) > 5:
+                            notification_parts.append(f"  ... and {len(evts) - 5} more")
 
                 # One-way mirrored events (Google → iCloud, prefixed)
                 if oneway_result['added'] > 0:

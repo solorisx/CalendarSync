@@ -34,10 +34,45 @@ Events are tracked by their actual UID (no prefixes) to prevent duplicates. Each
   on the other side as a duplicate. Absent on entries written by older versions,
   which fall back to `start`.
 
+Write-back-related keys:
+- `writeback_denied` - set when a one-way source calendar rejected a patch (read-only
+  share). Reported once, then the entry's iCloud baseline is kept moving so the failure
+  is not re-reported every cycle.
+- `oneway_recurring` - the mirror pass fetches with `singleEvents=True`, so a mirrored
+  recurring series is stored under an *expanded occurrence* id. Write-back refuses those
+  rather than silently editing a single occurrence of the source series. Refreshed on
+  every mirror pass, so entries written before the flag existed heal themselves.
+
+Every update path refreshes `start`/`end`/`title` on the entry via `_refresh_entry_times`.
+This is not cosmetic: `_cleanup_past_events` and both deletion-window gates read those
+fields, so an event rescheduled out of the window would otherwise be pruned as "past" and
+re-created as a duplicate on the next pass.
+
 This allows the sync to:
 - Detect and skip already-synced events
 - Propagate deletions: if an event is deleted from its source, it's removed from the destination
 - Avoid ping-pong effect where events get re-synced repeatedly
+
+### Write-Back of Target-Side Edits
+Every event has an owning calendar (the one it was created in). An edit made on the *copy*
+is propagated home, gated by `config.json`:
+- `sync_target_updates.to_google` (default true) - a Google-origin event edited in iCloud is
+  patched back into Google.
+- `sync_target_updates.to_icloud` (default true) - an iCloud-origin event edited in Google is
+  written back into the iCloud event.
+- `oneway_google_calendars[].writeback` (default false) - a mirrored event edited in iCloud is
+  patched into **its own source calendar**, never the primary.
+
+Read `_target_updates_enabled()` and `_writeback_to_google()` in `sync_calendars.py`.
+
+The invariant every propagation path must preserve (see the `_same_instant` docstring): compare
+a side's timestamp only against that side's stored baseline, and after writing to a side, null
+the *other* side's baseline so it re-captures the post-write timestamp instead of mistaking it
+for a user edit. A write-back also refreshes `recurrence_sig`, or the forward pass sees a
+phantom recurrence change and bounces a spurious update back.
+
+Conflict rule: if both sides changed within one interval, the Google-side edit wins, because
+`run_sync` runs the Google → iCloud pass first.
 
 ## Development Commands
 
@@ -166,6 +201,10 @@ Rebuild the container when modifying:
 Use: `docker-compose build && docker-compose up -d`
 
 ## Common Modifications
+
+### Disabling Write-Back
+Set `"sync_target_updates": false` in `data/config.json` (no rebuild needed, just
+`docker-compose restart`) to make the owning calendar strictly authoritative again.
 
 ### Changing Sync Direction
 To make sync unidirectional, comment out one of the sync calls in `run_sync()`:
