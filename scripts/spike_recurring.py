@@ -24,10 +24,14 @@ All writes use disposable events prefixed "CALSYNC-SPIKE-" and are deleted at th
 skips every write. Optional `--fixtures-dir DIR` dumps the read-back payloads of the
 spike's OWN synthetic events (no personal data) so they can seed contract tests.
 
-Run inside the container so /app/data (config + token) is present:
+Run inside the container, where /app/data (config + token) is mounted:
     docker-compose run --rm calendar-sync python scripts/spike_recurring.py
     docker-compose run --rm calendar-sync python scripts/spike_recurring.py --read-only
     docker-compose run --rm calendar-sync python scripts/spike_recurring.py --cleanup
+
+...or straight from the repo root on the host (falls back to ./data automatically;
+CALSYNC_DATA_DIR overrides it):
+    python3 scripts/spike_recurring.py --read-only
 """
 import argparse
 import json

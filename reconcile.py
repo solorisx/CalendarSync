@@ -32,10 +32,19 @@ import caldav
 # ---------------------------------------------------------------------------
 # Config / paths (same as sync_calendars.py)
 # ---------------------------------------------------------------------------
-CONFIG_FILE = '/app/data/config.json'
-TOKEN_FILE = '/app/data/token.pickle'
-STATE_FILE = '/app/data/sync_state.json'
-CREDENTIALS_FILE = '/app/data/credentials.json'
+# Data directory: the container mount point when it exists, otherwise the repo's
+# own ./data so host runs (scripts, spikes, tests) work without extra setup.
+# CALSYNC_DATA_DIR overrides both.
+def _default_data_dir():
+    if os.path.isdir('/app/data'):
+        return '/app/data'
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
+DATA_DIR = os.path.expanduser(os.getenv('CALSYNC_DATA_DIR') or _default_data_dir())
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+TOKEN_FILE = os.path.join(DATA_DIR, 'token.pickle')
+STATE_FILE = os.path.join(DATA_DIR, 'sync_state.json')
+CREDENTIALS_FILE = os.path.join(DATA_DIR, 'credentials.json')
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
