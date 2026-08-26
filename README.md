@@ -178,6 +178,29 @@ Then restart: `docker-compose restart`
 - Delete an event in iCloud Calendar → automatically deleted from Google Calendar
 - Only events created by this sync tool are deleted (based on source tracking)
 
+### Recurring Events
+
+Recurring events sync as **real recurring series** (they carry their `RRULE`), so a
+weekly meeting is a single recurring event on both sides — not dozens of copies.
+Deleting a single occurrence propagates as an exclusion (`EXDATE`). Editing or moving a
+*single* occurrence of a series (an override) is not synced separately in this version.
+
+**One-time cutover after upgrading:** earlier versions expanded recurring series into many
+per-occurrence copies. After upgrading, each series becomes one recurring event, but the old
+copies remain in Google Calendar. They are **not** deleted automatically. To clean them up:
+
+```bash
+docker-compose run --rm calendar-sync python reconcile.py --list-fanout
+```
+
+This is **read-only** — it lists the leftover duplicate events (grouped by series) so you can
+delete them by hand in Google Calendar. The sync state self-heals afterward.
+
+### Known Limitation
+
+Editing an **iCloud-originated** event on the **Google** side is not propagated back to iCloud
+(iCloud is treated as the source of truth for those events). Edit such events in iCloud.
+
 ## Notifications
 
 ### Setting up ntfy.sh

@@ -142,8 +142,7 @@ def fetch_google_events(service, calendar_id, time_min, time_max):
             calendarId=calendar_id,
             timeMin=time_min,
             timeMax=time_max,
-            singleEvents=True,
-            orderBy='startTime',
+            singleEvents=False,  # compare recurring MASTERS, matching the sync engine
             pageToken=page_token,
         ).execute()
         items = result.get('items', [])
@@ -160,7 +159,7 @@ def fetch_icloud_events(icloud_calendar, start, end):
     """Fetch all iCloud events in range. Returns list of (event_id, component) tuples."""
     logger.debug(f"Fetching iCloud events from {start.isoformat()} to {end.isoformat()}")
     with SuppressCaldavOutput():
-        raw_events = icloud_calendar.date_search(start=start, end=end, expand=True)
+        raw_events = icloud_calendar.date_search(start=start, end=end, expand=False)
     logger.debug(f"Total iCloud raw event objects fetched: {len(raw_events)}")
 
     parsed = []
@@ -177,17 +176,11 @@ def fetch_icloud_events(icloud_calendar, start, end):
             if component.name != 'VEVENT':
                 continue
 
-            uid = str(component.get('uid', ''))
-            recurrence_id = component.get('recurrence-id')
-            if recurrence_id:
-                rec_str = (
-                    recurrence_id.dt.isoformat()
-                    if hasattr(recurrence_id.dt, 'isoformat')
-                    else str(recurrence_id.dt)
-                )
-                event_id = f"{uid}_{rec_str}"
-            else:
-                event_id = uid
+            # expand=False: one master per series. Skip RECURRENCE-ID overrides so the
+            # comparison is master-to-master (matching the non-expanded sync engine).
+            if component.get('recurrence-id'):
+                continue
+            event_id = str(component.get('uid', ''))
 
             parsed.append((event_id, component))
 
@@ -557,6 +550,59 @@ def run_sync():
     return success
 
 
+def list_fanout():
+    """Read-only: list legacy fan-out duplicate events (old per-occurrence copies from
+    before recurring-event support) so they can be deleted MANUALLY in Google Calendar.
+    Makes no changes."""
+    from collections import defaultdict
+    if not os.path.exists(CONFIG_FILE):
+        logger.error(f"Config file not found: {CONFIG_FILE}")
+        sys.exit(1)
+    with open(CONFIG_FILE) as f:
+        config = json.load(f)
+    state = {}
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    synced = state.get('synced_events', {})
+    fanout_keys = [k for k, v in synced.items()
+                   if v.get('legacy_fanout') or str(v.get('title') or '').endswith(' (recurring)')]
+    if not fanout_keys:
+        print("No legacy fan-out entries found in sync state. Nothing to clean up.")
+        return
+
+    now = datetime.now(timezone.utc)
+    past = int(os.getenv('SYNC_PAST_DAYS', '1'))
+    future = int(os.getenv('SYNC_FUTURE_DAYS', '1825'))
+    time_min = (now - timedelta(days=past)).isoformat().replace('+00:00', 'Z')
+    time_max = (now + timedelta(days=future)).isoformat().replace('+00:00', 'Z')
+    google = fetch_google_events(get_google_service(), config['google_calendar_id'], time_min, time_max)
+    g_by_uid = {e.get('iCalUID', e['id']): e for e in google}
+
+    groups = defaultdict(list)
+    for k in fanout_keys:
+        groups[k.rsplit('_', 1)[0] if '_' in k else k].append(k)
+
+    print(f"\nLegacy fan-out duplicates in sync state: {len(fanout_keys)} entr(y/ies) across "
+          f"{len(groups)} series.")
+    print("These are old per-occurrence copies from before recurring-event support; they are")
+    print("excluded from automatic deletion. Delete the ones still present in Google Calendar")
+    print("by hand — the sync state self-heals on the next sync. This report changes nothing.\n")
+    total_live = 0
+    for base, keys in sorted(groups.items()):
+        title = synced[keys[0]].get('title', '?')
+        live = [k for k in keys if k in g_by_uid]
+        total_live += len(live)
+        print(f"  • {title}  — {len(keys)} state entr(y/ies), {len(live)} still in Google")
+        for k in live[:10]:
+            g = g_by_uid[k]
+            start = (g['start'].get('dateTime') or g['start'].get('date', ''))[:16]
+            print(f"       delete in Google: {g.get('summary', '?')} ({start})  [id {g['id']}]")
+        if len(live) > 10:
+            print(f"       ... and {len(live) - 10} more still in Google")
+    print(f"\n{total_live} fan-out event(s) still present in Google Calendar. No changes were made.")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Calendar reconciliation and sync tool.',
@@ -573,7 +619,13 @@ Examples:
                         help='Run a sync before reconciling')
     parser.add_argument('--resync-orphans', action='store_true',
                         help='Interactively remove orphaned sync state entries so the next sync re-pushes them')
+    parser.add_argument('--list-fanout', action='store_true',
+                        help='Read-only: list legacy fan-out duplicate events to delete manually')
     args = parser.parse_args()
+
+    if args.list_fanout:
+        list_fanout()
+        sys.exit(0)
 
     if args.sync:
         ok = run_sync()
