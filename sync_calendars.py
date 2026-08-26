@@ -470,8 +470,7 @@ class CalendarSync:
                 calendarId=self.config['google_calendar_id'],
                 timeMin=time_min,
                 timeMax=time_max,
-                singleEvents=True,
-                orderBy='startTime',
+                singleEvents=False,
                 pageToken=page_token
             ).execute()
             events.extend(events_result.get('items', []))
@@ -489,22 +488,19 @@ class CalendarSync:
         updated_events = []
         deleted_events = []
 
-        # Deduplicate recurring event instances by iCalUID — singleEvents=True expands
-        # each occurrence of a recurring series into its own event with a unique composite ID.
-        # We only want to sync one representative instance per series (the first one returned,
-        # which is the earliest upcoming occurrence) to avoid flooding iCloud with duplicates.
-        seen_ical_uids = set()
-        deduped_events = []
+        # With singleEvents=False a recurring series returns as ONE master event carrying
+        # a recurrence[] array (RRULE/RDATE/EXDATE) — written to iCloud as a single recurring
+        # VEVENT rather than N per-occurrence copies. Exception items (recurringEventId set)
+        # are individual modified/cancelled occurrences; per-instance overrides are not synced
+        # as separate events in this pass. (Occurrence cancellations that live on the master's
+        # own EXDATE still sync, because they travel inside recurrence[].)
+        base_events = []
         for event in events:
-            ical_uid = event.get('iCalUID', event['id'])
-            if ical_uid in seen_ical_uids:
-                logger.debug(f"  Skipping duplicate recurring instance: {event.get('summary')} (iCalUID: {ical_uid})")
+            if event.get('recurringEventId'):
+                logger.debug(f"  Skipping recurring exception/override (not synced separately): {event.get('summary')}")
                 continue
-            seen_ical_uids.add(ical_uid)
-            deduped_events.append(event)
-        if len(deduped_events) < len(events):
-            logger.debug(f"Deduplicated {len(events)} events to {len(deduped_events)} (removed {len(events) - len(deduped_events)} recurring instances)")
-        events = deduped_events
+            base_events.append(event)
+        events = base_events
 
         # Track current Google event UIDs (use plain event ID, not iCalUID)
         # We use event['id'] to match what we store in sync_state
@@ -518,24 +514,18 @@ class CalendarSync:
                 icloud_events = icloud_calendar.date_search(
                     start=start_dt,
                     end=end_dt,
-                    expand=True
+                    expand=False
                 )
             for icloud_event in icloud_events:
                 try:
                     ical = Calendar.from_ical(icloud_event.data)
                     for component in ical.walk():
                         if component.name == "VEVENT":
-                            # For recurring event instances, create unique ID with recurrence-id or dtstart
-                            recurrence_id = component.get('recurrence-id')
-                            uid = str(component.get('uid'))
-                            if recurrence_id:
-                                # This is a specific instance of a recurring event
-                                recurrence_str = recurrence_id.dt.isoformat() if hasattr(recurrence_id.dt, 'isoformat') else str(recurrence_id.dt)
-                                event_id = f"{uid}_{recurrence_str}"
-                            else:
-                                # Single event or master recurring event
-                                event_id = uid
-                            existing_icloud_events[event_id] = icloud_event
+                            # expand=False → one VEVENT per event (masters carry RRULE). Skip
+                            # RECURRENCE-ID override instances; index masters/singles by UID.
+                            if component.get('recurrence-id'):
+                                continue
+                            existing_icloud_events[str(component.get('uid'))] = icloud_event
                 except Exception:
                     pass
         except Exception as e:
@@ -603,6 +593,11 @@ class CalendarSync:
                                     component.pop('dtend', None)
                                     component.add('dtstart', ev_start)
                                     component.add('dtend', ev_end)
+                                    # Refresh recurrence too (RRULE/EXDATE may have changed).
+                                    component.pop('rrule', None)
+                                    component.pop('rdate', None)
+                                    component.pop('exdate', None)
+                                    self._apply_google_recurrence(component, event.get('recurrence'))
                                     break
                             icloud_event.data = cal.to_ical()
                             icloud_event.save()
@@ -650,6 +645,11 @@ class CalendarSync:
             ical_event.add('dtstart', ev_start)
             ical_event.add('dtend', ev_end)
             ical_event.add('uid', safe_uid)
+
+            # Carry the recurrence (RRULE/RDATE/EXDATE, incl. any occurrence cancellations
+            # already on the master) so a recurring series is written to iCloud as ONE
+            # recurring VEVENT, not N copies.
+            self._apply_google_recurrence(ical_event, event.get('recurrence'))
 
             # Add 30-minute reminder
             alarm = Alarm()
@@ -729,7 +729,7 @@ class CalendarSync:
                     icloud_events = list(icloud_calendar.date_search(
                         start=start_dt,
                         end=end_dt,
-                        expand=True
+                        expand=False
                     ))
                 logger.debug(f"  Searching through {len(icloud_events)} iCloud events")
                 found = False
@@ -793,7 +793,7 @@ class CalendarSync:
         now, start, end, time_min, time_max = self._sync_window()
 
         with SuppressCaldavOutput():
-            events = icloud_calendar.date_search(start=start, end=end, expand=True)
+            events = icloud_calendar.date_search(start=start, end=end, expand=False)
         synced_count = 0
         updated_count = 0
         deleted_count = 0
@@ -826,8 +826,7 @@ class CalendarSync:
                     calendarId=self.config['google_calendar_id'],
                     timeMin=time_min,
                     timeMax=time_max,
-                    singleEvents=True,
-                    orderBy='startTime',
+                    singleEvents=False,
                     pageToken=page_token
                 ).execute()
                 all_google_events.extend(google_events_result.get('items', []))
@@ -867,15 +866,19 @@ class CalendarSync:
                 if component.name == "VEVENT":
                     uid = str(component.get('uid'))
 
-                    # For recurring event instances, create unique ID with recurrence-id or dtstart
-                    recurrence_id = component.get('recurrence-id')
-                    if recurrence_id:
-                        recurrence_str = recurrence_id.dt.isoformat() if hasattr(recurrence_id.dt, 'isoformat') else str(recurrence_id.dt)
-                        event_id = f"{uid}_{recurrence_str}"
-                    else:
-                        event_id = uid
+                    # expand=False → masters carry RRULE, single events stand alone, and a
+                    # modified occurrence appears as a RECURRENCE-ID override VEVENT. Per the
+                    # chosen recurring depth, per-instance overrides are not synced as separate
+                    # Google events (occurrence cancellations ride on the master's EXDATE).
+                    if component.get('recurrence-id'):
+                        logger.debug(f"  Skipping iCloud recurrence override (not synced separately): {uid}")
+                        continue
+                    event_id = uid
 
                     current_icloud_ids.add(event_id)
+
+                    # Google recurrence[] strings for this event (empty for non-recurring).
+                    recurrence_lines = self._extract_ical_recurrence(component)
 
                     # Get iCloud last-modified timestamp
                     last_modified_prop = component.get('last-modified')
@@ -896,7 +899,7 @@ class CalendarSync:
                             logger.debug(f"  Captured iCloud baseline for '{component.get('summary')}' (no propagation)")
                             continue
                         if last_modified and not _same_instant(last_modified, baseline):
-                            event_title = str(component.get('summary', 'No Title')) + (" (recurring)" if recurrence_id else "")
+                            event_title = str(component.get('summary', 'No Title'))
                             logger.debug(f"  Event modified: {event_title} (was: {baseline}, now: {last_modified})")
                             # Find the Google event and update it
                             g_event = existing_google_events.get(event_id)
@@ -917,6 +920,9 @@ class CalendarSync:
                                     }
                                     if component.get('description'):
                                         patch_body['description'] = str(component.get('description'))
+                                    # Keep the series' recurrence in sync (RRULE/EXDATE edits).
+                                    if recurrence_lines:
+                                        patch_body['recurrence'] = recurrence_lines
                                     google_service.events().patch(
                                         calendarId=self.config['google_calendar_id'],
                                         eventId=g_event['id'],
@@ -954,7 +960,7 @@ class CalendarSync:
                         event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
                         self._record_synced_event(
                             event_id,
-                            str(component.get('summary')) + (" (recurring)" if recurrence_id else ""),
+                            str(component.get('summary')),
                             source='icloud', start=event_start, last_modified=last_modified,
                             last_modified_icloud=last_modified
                         )
@@ -993,9 +999,13 @@ class CalendarSync:
 
                     if component.get('description'):
                         google_event['description'] = str(component.get('description'))
+                    # Write the series as a real recurring Google event (one master), not
+                    # N expanded copies. Empty for non-recurring events.
+                    if recurrence_lines:
+                        google_event['recurrence'] = recurrence_lines
 
                     event_start = dtstart.isoformat() if isinstance(dtstart, datetime) else str(dtstart)
-                    event_title = str(component.get('summary')) + (" (recurring)" if recurrence_id else "")
+                    event_title = str(component.get('summary'))
                     logger.debug(f"Adding event to Google: {google_event['summary']} ({start_dict})")
 
                     try:
@@ -1009,7 +1019,7 @@ class CalendarSync:
                             start=event_start, last_modified=last_modified,
                             last_modified_icloud=last_modified
                         )
-                        synced_count += 1 if not recurrence_id else 0  # Count only master events
+                        synced_count += 1
                         added_events.append({
                             'title': event_title,
                             'start': event_start
@@ -1033,7 +1043,7 @@ class CalendarSync:
                                     result = google_service.events().list(
                                         calendarId=self.config['google_calendar_id'],
                                         iCalUID=event_id,
-                                        singleEvents=True,
+                                        singleEvents=False,
                                     ).execute()
                                     items = result.get('items', [])
                                     if items:

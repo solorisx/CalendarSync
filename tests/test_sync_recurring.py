@@ -13,7 +13,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests dir (sibling imports)
 from sync_calendars import CalendarSync
 from icalendar import Event, Calendar
 
@@ -69,6 +70,83 @@ def test_empty_recurrence_is_noop():
     ev = _vevent()
     CalendarSync._apply_google_recurrence(ev, [])
     assert CalendarSync._extract_ical_recurrence(ev) == []
+
+
+from datetime import timedelta
+from test_sync_pingpong import FakeICloudCalendar, SandboxSync, cycle
+
+
+def _icloud_master_ics(uid, summary, recurrence_lines, start):
+    cal = Calendar(); ev = Event()
+    ev.add('summary', summary); ev.add('uid', uid)
+    ev.add('dtstart', start); ev.add('dtend', start + timedelta(hours=1))
+    CalendarSync._apply_google_recurrence(ev, recurrence_lines)
+    cal.add_component(ev)
+    return cal.to_ical()
+
+
+def _one_icloud_vevent(ic):
+    cal = Calendar.from_ical(next(iter(ic.store.values())))
+    return next(c for c in cal.walk() if c.name == "VEVENT")
+
+
+def test_icloud_recurring_series_creates_ONE_google_master():
+    """The headline fix: a weekly iCloud series must become ONE recurring Google event
+    (carrying recurrence[]), not ~52 fanned-out singles."""
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {}
+    ic = FakeICloudCalendar()
+    ic._store(_icloud_master_ics("icloud-weekly-1", "Standup",
+                                 ["RRULE:FREQ=WEEKLY;BYDAY=MO"], start))
+    s = SandboxSync(g, ic)
+    cycle(s)
+    assert len(g) == 1, f"expected ONE Google master, got {len(g)}: {list(g)}"
+    ev = next(iter(g.values()))
+    assert any("RRULE" in r for r in ev.get("recurrence", [])), ev.get("recurrence")
+
+
+def test_google_recurring_master_creates_ONE_icloud_vevent():
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {"gid_daily": {"id": "gid_daily", "iCalUID": "gid_daily@google.com",
+                       "summary": "Daily", "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+                       "start": {"dateTime": start.isoformat().replace("+00:00", "Z")},
+                       "end": {"dateTime": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+                       "updated": "2026-01-01T00:00:00Z"}}
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    cycle(s)
+    assert len(ic.store) == 1, f"expected ONE iCloud VEVENT, got {len(ic.store)}"
+    ve = _one_icloud_vevent(ic)
+    assert ve.get("rrule") is not None, "iCloud VEVENT must carry RRULE"
+
+
+def test_recurring_no_pingpong_icloud_origin():
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {}
+    ic = FakeICloudCalendar(bump_on_update=True, emit_last_modified=True)
+    ic._store(_icloud_master_ics("icloud-weekly-2", "Standup",
+                                 ["RRULE:FREQ=WEEKLY"], start))
+    s = SandboxSync(g, ic)
+    cycle(s)  # initial mirror
+    for _ in range(4):
+        gr, ir = cycle(s)
+        assert gr["updated"] == 0 and ir["updated"] == 0, f"recurring ping-pong: {gr} {ir}"
+    assert len(g) == 1
+
+
+def test_icloud_exdate_propagates_to_google():
+    """An occurrence cancelled in iCloud (EXDATE on the master) must reach Google's
+    recurrence[] — the user's real cancellation path."""
+    start = datetime(2026, 3, 2, 9, tzinfo=timezone.utc)
+    g = {}
+    ic = FakeICloudCalendar()
+    ic._store(_icloud_master_ics("icloud-weekly-3", "Standup",
+                                 ["RRULE:FREQ=WEEKLY", "EXDATE:20260309T090000Z"], start))
+    s = SandboxSync(g, ic)
+    cycle(s)
+    ev = next(iter(g.values()))
+    rec = ev.get("recurrence", [])
+    assert any("RRULE" in r for r in rec) and any("EXDATE" in r for r in rec), rec
 
 
 def _run_all():
