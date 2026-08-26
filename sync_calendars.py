@@ -242,8 +242,26 @@ class CalendarSync:
             # Ensure all expected keys are present (older state files may lack some)
             for k, v in default.items():
                 loaded.setdefault(k, v)
+            self._migrate_fanout(loaded)
             return loaded
         return dict(default)
+
+    @staticmethod
+    def _migrate_fanout(loaded):
+        """Neutralize legacy per-occurrence 'fan-out' entries from the old expand-everything
+        sync. Those entries carry the historical ' (recurring)' title suffix. We KEEP them so
+        the leftover Google singles stay recognized as already-synced (the is_icloud_origin
+        guard then leaves them alone, so they are never re-pushed to iCloud), but flag them so
+        deletion-detection never auto-removes them — cutover cleanup of those duplicates is
+        manual (see reconcile.py --list-fanout). Idempotent."""
+        migrated = 0
+        for entry in loaded.get('synced_events', {}).values():
+            if str(entry.get('title') or '').endswith(' (recurring)') and not entry.get('legacy_fanout'):
+                entry['legacy_fanout'] = True
+                migrated += 1
+        if migrated:
+            logger.info(f"Migration: flagged {migrated} legacy fan-out event(s); excluded from "
+                        f"deletion. Run 'reconcile.py --list-fanout' to clean up the duplicates.")
 
     def save_state(self):
         """Save sync state atomically.
@@ -690,6 +708,8 @@ class CalendarSync:
         events_to_delete = []
         logger.debug(f"Checking for deleted Google events. Synced events count: {len(self.state['synced_events'])}")
         for event_id, event_info in self.state['synced_events'].items():
+            if event_info.get('legacy_fanout'):
+                continue  # legacy fan-out duplicate: never auto-delete (manual cleanup)
             if event_info.get('source') == 'google':
                 # Check if event is within the time window
                 event_start = event_info.get('start')
@@ -1092,6 +1112,8 @@ class CalendarSync:
         logger.debug(f"Checking for deleted iCloud events. Synced events count: {len(self.state['synced_events'])}")
         logger.debug(f"Current iCloud IDs: {current_icloud_ids}")
         for event_id, event_info in self.state['synced_events'].items():
+            if event_info.get('legacy_fanout'):
+                continue  # legacy fan-out duplicate: never auto-delete (manual cleanup)
             if event_info.get('source') == 'icloud':
                 # Check if event is within the time window
                 event_start = event_info.get('start')

@@ -149,6 +149,33 @@ def test_icloud_exdate_propagates_to_google():
     assert any("RRULE" in r for r in rec) and any("EXDATE" in r for r in rec), rec
 
 
+def test_migration_flags_legacy_fanout_only():
+    loaded = {"synced_events": {
+        "uid_2026-03-02T09:00:00+00:00": {"title": "Standup (recurring)", "source": "icloud"},
+        "normal-1": {"title": "Lunch", "source": "icloud"},
+    }}
+    CalendarSync._migrate_fanout(loaded)
+    assert loaded["synced_events"]["uid_2026-03-02T09:00:00+00:00"].get("legacy_fanout") is True
+    assert "legacy_fanout" not in loaded["synced_events"]["normal-1"]
+
+
+def test_legacy_fanout_single_not_auto_deleted_or_repushed():
+    """A leftover fan-out single in Google must be neither auto-deleted (manual cleanup)
+    nor re-pushed to iCloud."""
+    key = "uid_2026-03-02T09:00:00+00:00"
+    g = {"gid_x": {"id": "gid_x", "iCalUID": key, "summary": "Standup (recurring)",
+                   "start": {"dateTime": "2026-03-02T09:00:00Z"},
+                   "end": {"dateTime": "2026-03-02T09:30:00Z"}, "updated": "2026-01-01T00:00:00Z"}}
+    ic = FakeICloudCalendar()
+    s = SandboxSync(g, ic)
+    s.state["synced_events"][key] = {"title": "Standup (recurring)", "source": "icloud",
+                                     "start": "2026-03-02T09:00:00+00:00",
+                                     "icloud_uid": key, "legacy_fanout": True}
+    cycle(s)
+    assert "gid_x" in g, "legacy fan-out single must NOT be auto-deleted from Google"
+    assert len(ic.store) == 0, "legacy fan-out single must NOT be re-pushed to iCloud"
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
