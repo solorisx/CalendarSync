@@ -5,6 +5,7 @@ Bidirectional calendar synchronization between Google Calendar and iCloud Calend
 ## Features
 
 - ✅ **Bidirectional Sync** - Events sync both ways between Google and iCloud
+- ➡️ **One-Way Mirror Calendars** - Mirror extra Google calendars into iCloud (with a title prefix), never synced back to Google
 - 🔄 **Automatic Sync** - Runs continuously on a configurable interval (default: 15 minutes)
 - 🗑️ **Deletion Propagation** - Deleting an event in one calendar removes it from the other
 - 📱 **Smart Notifications** - Get notified only when events are added/deleted (via ntfy.sh)
@@ -64,6 +65,12 @@ Edit `data/config.json`:
     "password": "xxxx-xxxx-xxxx-xxxx",
     "calendar_name": "Calendar"
   },
+  "oneway_google_calendars": [
+    {
+      "calendar_id": "team-calendar-id@group.calendar.google.com",
+      "prefix": "[Team] "
+    }
+  ],
   "notify_url": "https://ntfy.sh/your-unique-channel"
 }
 ```
@@ -71,7 +78,40 @@ Edit `data/config.json`:
 **Configuration notes:**
 - `google_calendar_id`: Use `"primary"` for your main calendar, or specific calendar ID
 - `calendar_name`: Name of your iCloud calendar (usually "Calendar", run sync to see available names in error message if wrong)
+- `oneway_google_calendars`: Optional - see [One-Way Mirror Calendars](#one-way-mirror-calendars) below. Omit or set to `[]` to disable.
 - `notify_url`: Optional - set to `null` or `""` to disable notifications
+
+#### One-Way Mirror Calendars
+
+In addition to the bidirectional pair above, you can **one-way mirror** any number of
+*extra* Google calendars into your iCloud calendar. Each mirrored event gets a
+configurable title **prefix** so you can tell it apart from your regular events:
+
+```json
+"oneway_google_calendars": [
+  { "calendar_id": "team-calendar-id@group.calendar.google.com", "prefix": "[Team] " },
+  { "calendar_id": "another-id@group.calendar.google.com",       "prefix": "[Ops] " }
+]
+```
+
+- `calendar_id`: The ID of the extra Google calendar to mirror (find it under Google
+  Calendar → Settings → *Integrate calendar* → *Calendar ID*). The account authorized
+  during setup must have read access to it.
+- `prefix`: Text prepended to each event's title in iCloud (e.g. `"[Team] "`). Include a
+  trailing space if you want one. The source event in Google is never modified, and the
+  prefix never accumulates across syncs.
+
+**Guarantees:**
+- **One-way only.** These events flow Google → iCloud exclusively. They are **never**
+  written back to Google (not to the source calendar, your primary, or any other), and
+  they never interfere with the primary bidirectional sync.
+- **Same iCloud calendar.** Mirrored events land in the calendar named by `calendar_name`,
+  distinguished only by their prefix.
+- **Deletions propagate.** Removing an event from the source Google calendar removes its
+  mirrored copy from iCloud on the next sync.
+
+> Note: because mirrored events exist only in iCloud (by design), the standalone
+> `reconcile.py` audit reports them under "iCloud only" — this is expected and harmless.
 
 ### 5. Initial Authentication
 

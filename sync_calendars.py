@@ -326,7 +326,7 @@ class CalendarSync:
         if to_remove:
             logger.debug(f"Removed {len(to_remove)} past event(s) from sync state")
 
-    def _record_synced_event(self, event_id, title, source, start, last_modified=None, failed=False, error=None, icloud_uid=None, last_modified_google=None, last_modified_icloud=None):
+    def _record_synced_event(self, event_id, title, source, start, last_modified=None, failed=False, error=None, icloud_uid=None, last_modified_google=None, last_modified_icloud=None, source_calendar_id=None):
         """Record a synced event in the state"""
         existing = self.state['synced_events'].get(event_id, {})
         entry = {
@@ -340,6 +340,11 @@ class CalendarSync:
             'last_modified_google': last_modified_google or existing.get('last_modified_google'),
             'last_modified_icloud': last_modified_icloud or existing.get('last_modified_icloud'),
         }
+        # For one-way mirrored calendars, remember which Google calendar the event
+        # came from so deletion detection can be scoped per source calendar.
+        source_calendar_id = source_calendar_id or existing.get('source_calendar_id')
+        if source_calendar_id:
+            entry['source_calendar_id'] = source_calendar_id
         if failed:
             entry['sync_failed'] = True
             entry['error'] = error
@@ -844,6 +849,281 @@ class CalendarSync:
             'errors': error_count
         }
 
+    def _oneway_icloud_uid(self, calendar_id, google_event_id):
+        """Build a collision-safe iCloud UID for a one-way mirrored Google event.
+
+        The mirror shares the primary iCloud calendar, so we namespace the UID with
+        a short hash of the source calendar id to guarantee it can never collide with
+        a primary Google event's UID (or another mirrored calendar's). Deterministic:
+        the same Google event always maps to the same iCloud UID.
+        """
+        cal_hash = hashlib.sha256(str(calendar_id).encode()).hexdigest()[:12]
+        # Strip Google-internal leading underscores that iCloud rejects.
+        base = str(google_event_id).lstrip('_')
+        uid = f"ow-{cal_hash}-{base}"
+        # iCloud rejects UIDs longer than ~255 chars; hash overly long ones (keep prefix).
+        if len(uid) > 200:
+            uid = f"ow-{cal_hash}-" + hashlib.sha256(base.encode()).hexdigest()
+        return uid
+
+    def sync_google_oneway_to_icloud(self, google_service, icloud_calendar):
+        """One-way mirror additional Google calendars into the (shared) iCloud calendar.
+
+        Events are copied Google -> iCloud only, with a configurable title prefix per
+        calendar. They are recorded with source='google_oneway' so they are NEVER pushed
+        back to Google (see google_origin_icloud_uids in sync_icloud_to_google) and are
+        untouched by the primary direction's deletion sweep (which only handles
+        source=='google'). Deletions in the source Google calendar are propagated to iCloud.
+        """
+        oneway_calendars = self.config.get('oneway_google_calendars', []) or []
+        synced_count = 0
+        updated_count = 0
+        deleted_count = 0
+        error_count = 0
+        added_events = []
+        updated_events = []
+        deleted_events = []
+
+        if not oneway_calendars:
+            return {
+                'added': synced_count, 'updated': updated_count, 'deleted': deleted_count,
+                'added_events': added_events, 'updated_events': updated_events,
+                'deleted_events': deleted_events, 'errors': error_count,
+            }
+
+        logger.info(f"→ One-way mirroring {len(oneway_calendars)} additional Google calendar(s) → iCloud...")
+
+        now = datetime.now(timezone.utc)
+        time_min = (now - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+        time_max = (now + timedelta(days=360)).isoformat().replace('+00:00', 'Z')
+
+        # Fetch existing iCloud events once, keyed by UID, to detect creates vs updates
+        # and to locate events for deletion. Mirror the indexing used in sync_google_to_icloud.
+        existing_icloud_events = {}
+        try:
+            with SuppressCaldavOutput():
+                icloud_events = icloud_calendar.date_search(
+                    start=now - timedelta(days=1),
+                    end=now + timedelta(days=360),
+                    expand=True
+                )
+            for icloud_event in icloud_events:
+                try:
+                    ical = Calendar.from_ical(icloud_event.data)
+                    for component in ical.walk():
+                        if component.name == "VEVENT":
+                            existing_icloud_events[str(component.get('uid'))] = icloud_event
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Could not fetch existing iCloud events for one-way mirror: {e}")
+
+        for entry in oneway_calendars:
+            calendar_id = entry.get('calendar_id')
+            prefix = entry.get('prefix', '') or ''
+            if not calendar_id:
+                logger.warning("Skipping one-way calendar entry without 'calendar_id'")
+                continue
+
+            logger.info(f"  Mirroring calendar '{calendar_id}' (prefix: '{prefix}')")
+
+            # Page all events from this source calendar
+            events = []
+            page_token = None
+            try:
+                while True:
+                    events_result = google_service.events().list(
+                        calendarId=calendar_id,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy='startTime',
+                        pageToken=page_token
+                    ).execute()
+                    events.extend(events_result.get('items', []))
+                    page_token = events_result.get('nextPageToken')
+                    if not page_token:
+                        break
+            except Exception as e:
+                logger.error(f"  Failed to fetch events from '{calendar_id}': {e}")
+                error_count += 1
+                continue
+
+            # Deduplicate expanded recurring instances by iCalUID (one representative per series)
+            seen_ical_uids = set()
+            deduped_events = []
+            for event in events:
+                ical_uid = event.get('iCalUID', event['id'])
+                if ical_uid in seen_ical_uids:
+                    continue
+                seen_ical_uids.add(ical_uid)
+                deduped_events.append(event)
+            events = deduped_events
+
+            current_google_ids = {event['id'] for event in events}
+
+            for event in events:
+                event_uid = event['id']
+                # State is keyed per source calendar to avoid collisions across calendars.
+                state_key = f"ow:{calendar_id}:{event_uid}"
+                safe_uid = self._oneway_icloud_uid(calendar_id, event_uid)
+                base_title = event.get('summary', 'No Title')
+                prefixed_title = f"{prefix}{base_title}"
+                event_start = event['start'].get('dateTime', event['start'].get('date'))
+
+                # Already mirrored: update only if Google's timestamp changed
+                if state_key in self.state['synced_events'] and not self.state['synced_events'][state_key].get('sync_failed'):
+                    last_modified = event.get('updated')
+                    stored_state = self.state['synced_events'][state_key]
+                    stored_modified = stored_state.get('last_modified_google') or stored_state.get('last_modified') or stored_state.get('synced_at')
+                    if last_modified and stored_modified and last_modified != stored_modified and safe_uid in existing_icloud_events:
+                        try:
+                            icloud_event = existing_icloud_events[safe_uid]
+                            cal = Calendar.from_ical(icloud_event.data)
+                            for component in cal.walk():
+                                if component.name == "VEVENT":
+                                    component.pop('summary', None)
+                                    component.add('summary', prefixed_title)
+                                    if event.get('description'):
+                                        component.pop('description', None)
+                                        component.add('description', event['description'])
+                                    elif 'description' in component:
+                                        del component['description']
+                                    start = event['start'].get('dateTime', event['start'].get('date'))
+                                    end = event['end'].get('dateTime', event['end'].get('date'))
+                                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                                    end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                                    component.pop('dtstart', None)
+                                    component.pop('dtend', None)
+                                    component.add('dtstart', start_dt)
+                                    component.add('dtend', end_dt)
+                                    break
+                            icloud_event.data = cal.to_ical()
+                            icloud_event.save()
+                            self.state['synced_events'][state_key]['last_modified_google'] = last_modified
+                            self.state['synced_events'][state_key]['last_modified'] = last_modified
+                            self.state['synced_events'][state_key]['title'] = prefixed_title
+                            updated_count += 1
+                            updated_events.append({'title': prefixed_title, 'start': event_start})
+                            logger.info(f"  Updated in iCloud (mirror): {prefixed_title}")
+                        except Exception as e:
+                            logger.error(f"  Failed to update mirror '{prefixed_title}' in iCloud: {e}")
+                    continue
+
+                # Event already present in iCloud (e.g. state lost) — just record it
+                if safe_uid in existing_icloud_events:
+                    self._record_synced_event(
+                        state_key, prefixed_title, source='google_oneway',
+                        start=event_start, icloud_uid=safe_uid,
+                        last_modified_google=event.get('updated'),
+                        source_calendar_id=calendar_id
+                    )
+                    continue
+
+                # Create the mirrored iCloud event (prefixed title is the only difference)
+                cal = Calendar()
+                ical_event = Event()
+                ical_event.add('summary', prefixed_title)
+                if event.get('description'):
+                    ical_event.add('description', event['description'])
+
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo is not None:
+                    start_dt = start_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
+                    end_dt = end_dt.astimezone(datetime.now().astimezone().tzinfo.utc)
+
+                ical_event.add('dtstart', start_dt)
+                ical_event.add('dtend', end_dt)
+                ical_event.add('uid', safe_uid)
+
+                alarm = Alarm()
+                alarm.add('action', 'DISPLAY')
+                alarm.add('trigger', timedelta(minutes=-30))
+                alarm.add('description', 'Reminder')
+                ical_event.add_component(alarm)
+                cal.add_component(ical_event)
+
+                try:
+                    ical_data = cal.to_ical()
+                    retry(lambda: icloud_calendar.save_event(ical_data))
+                    self._record_synced_event(
+                        state_key, prefixed_title, source='google_oneway',
+                        start=event_start, last_modified=event.get('updated'),
+                        icloud_uid=safe_uid, last_modified_google=event.get('updated'),
+                        source_calendar_id=calendar_id
+                    )
+                    synced_count += 1
+                    added_events.append({'title': prefixed_title, 'start': event_start})
+                    logger.info(f"  Added to iCloud (mirror): {prefixed_title}")
+                except Exception as e:
+                    logger.error(f"  Failed to mirror '{prefixed_title}': {e}")
+                    self._record_synced_event(
+                        state_key, prefixed_title, source='google_oneway',
+                        start=event_start, last_modified=event.get('updated'),
+                        failed=True, error=str(e), source_calendar_id=calendar_id
+                    )
+                    error_count += 1
+
+            # Deletion propagation: mirrored events for THIS calendar no longer in Google
+            events_to_delete = []
+            for state_key, event_info in list(self.state['synced_events'].items()):
+                if event_info.get('source') != 'google_oneway':
+                    continue
+                if event_info.get('source_calendar_id') != calendar_id:
+                    continue
+                ev_start = event_info.get('start')
+                if not ev_start:
+                    continue
+                try:
+                    event_dt = datetime.fromisoformat(ev_start.replace('Z', '+00:00'))
+                except Exception:
+                    continue
+                if not (time_min <= event_dt.isoformat() <= time_max):
+                    continue
+                # state_key format is "ow:{calendar_id}:{google_event_id}". Strip the known
+                # prefix (calendar_id may itself contain ':') to recover the Google event id.
+                key_prefix = f"ow:{calendar_id}:"
+                if not state_key.startswith(key_prefix):
+                    continue
+                google_event_id = state_key[len(key_prefix):]
+                if google_event_id and google_event_id not in current_google_ids:
+                    events_to_delete.append((state_key, event_info))
+
+            for state_key, event_info in events_to_delete:
+                target_uid = event_info.get('icloud_uid')
+                try:
+                    icloud_event = existing_icloud_events.get(target_uid)
+                    if icloud_event is not None:
+                        icloud_event.delete()
+                        deleted_count += 1
+                        deleted_events.append({
+                            'title': event_info.get('title'),
+                            'start': event_info.get('start', 'unknown')
+                        })
+                        logger.info(f"  Deleted from iCloud (mirror): {event_info.get('title')}")
+                    else:
+                        logger.warning(f"  Could not find mirrored event {target_uid} in iCloud to delete")
+                    # Drop from state either way to avoid retrying forever
+                    del self.state['synced_events'][state_key]
+                except Exception as e:
+                    logger.error(f"  Error deleting mirrored event {target_uid}: {e}")
+
+        if synced_count or updated_count or deleted_count:
+            logger.info(f"One-way mirror: {synced_count} added, {updated_count} updated, {deleted_count} deleted in iCloud")
+
+        return {
+            'added': synced_count,
+            'updated': updated_count,
+            'deleted': deleted_count,
+            'added_events': added_events,
+            'updated_events': updated_events,
+            'deleted_events': deleted_events,
+            'errors': error_count
+        }
+
     def sync_icloud_to_google(self, google_service, icloud_calendar):
         """Sync events from iCloud to Google Calendar"""
         logger.info("← Syncing iCloud → Google...")
@@ -868,7 +1148,7 @@ class CalendarSync:
         google_origin_icloud_uids = {
             entry['icloud_uid']
             for entry in self.state['synced_events'].values()
-            if entry.get('source') == 'google' and entry.get('icloud_uid')
+            if entry.get('source') in ('google', 'google_oneway') and entry.get('icloud_uid')
         }
 
         # Get existing Google events to check for duplicates
@@ -1300,6 +1580,10 @@ class CalendarSync:
             icloud_calendar = self.get_icloud_calendar()
 
             google_result = self.sync_google_to_icloud(google_service, icloud_calendar)
+            # One-way mirror runs BEFORE the iCloud→Google direction so its state entries
+            # (source='google_oneway') are already recorded when that direction builds its
+            # back-sync exclusion set — guaranteeing mirrored events are never pushed to Google.
+            oneway_result = self.sync_google_oneway_to_icloud(google_service, icloud_calendar)
             icloud_result = self.sync_icloud_to_google(google_service, icloud_calendar)
 
             self.state['last_sync'] = datetime.now().isoformat()
@@ -1309,10 +1593,10 @@ class CalendarSync:
             self._cleanup_past_events()
             self.save_state()
 
-            total_added = google_result['added'] + icloud_result['added']
-            total_updated = google_result.get('updated', 0) + icloud_result.get('updated', 0)
-            total_deleted = google_result['deleted'] + icloud_result['deleted']
-            total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0)
+            total_added = google_result['added'] + icloud_result['added'] + oneway_result['added']
+            total_updated = google_result.get('updated', 0) + icloud_result.get('updated', 0) + oneway_result.get('updated', 0)
+            total_deleted = google_result['deleted'] + icloud_result['deleted'] + oneway_result['deleted']
+            total_errors = google_result.get('errors', 0) + icloud_result.get('errors', 0) + oneway_result.get('errors', 0)
 
             # Calculate elapsed time
             elapsed = time.time() - start_time
@@ -1324,6 +1608,8 @@ class CalendarSync:
                 time_str = f"{minutes}m {seconds:.1f}s"
 
             message = f"Sync complete: {google_result['added']} added from Google, {icloud_result['added']} added from iCloud, {google_result.get('updated', 0)} updated in iCloud, {icloud_result.get('updated', 0)} updated in Google, {google_result['deleted']} deleted from iCloud, {icloud_result['deleted']} deleted from Google"
+            if oneway_result['added'] or oneway_result.get('updated', 0) or oneway_result['deleted']:
+                message += f", mirror: {oneway_result['added']} added / {oneway_result.get('updated', 0)} updated / {oneway_result['deleted']} deleted in iCloud"
             message += f", {total_errors} errors occurred in {time_str}"
             logger.info(message)
 
@@ -1367,6 +1653,29 @@ class CalendarSync:
                     if icloud_result['updated'] > 5:
                         notification_parts.append(f"  ... and {icloud_result['updated'] - 5} more")
 
+                # One-way mirrored events (Google → iCloud, prefixed)
+                if oneway_result['added'] > 0:
+                    notification_parts.append(f"Mirrored {oneway_result['added']} to iCloud:")
+                    for evt in oneway_result['added_events'][:5]:
+                        date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
+                        notification_parts.append(f"  + {evt['title']} ({date_str})")
+                    if oneway_result['added'] > 5:
+                        notification_parts.append(f"  ... and {oneway_result['added'] - 5} more")
+                if oneway_result.get('updated', 0) > 0:
+                    notification_parts.append(f"Updated {oneway_result['updated']} mirrored in iCloud:")
+                    for evt in oneway_result['updated_events'][:5]:
+                        date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
+                        notification_parts.append(f"  ~ {evt['title']} ({date_str})")
+                    if oneway_result['updated'] > 5:
+                        notification_parts.append(f"  ... and {oneway_result['updated'] - 5} more")
+                if oneway_result['deleted'] > 0:
+                    notification_parts.append(f"Deleted {oneway_result['deleted']} mirrored from iCloud:")
+                    for evt in oneway_result['deleted_events'][:5]:
+                        date_str = evt['start'][:10] if len(evt['start']) > 10 else evt['start']
+                        notification_parts.append(f"  - {evt['title']} ({date_str})")
+                    if oneway_result['deleted'] > 5:
+                        notification_parts.append(f"  ... and {oneway_result['deleted'] - 5} more")
+
                 # Deleted events from Google
                 if google_result['deleted'] > 0:
                     notification_parts.append(f"Deleted {google_result['deleted']} from iCloud:")
@@ -1390,6 +1699,8 @@ class CalendarSync:
                     notification_parts.append(f"  ✗ {google_result['errors']} errors occurred from Google")
                 if icloud_result['errors'] > 0:
                     notification_parts.append(f"  ✗ {icloud_result['errors']} errors occurred from iCloud")
+                if oneway_result['errors'] > 0:
+                    notification_parts.append(f"  ✗ {oneway_result['errors']} errors occurred in one-way mirror")
 
                 notification_message = "\n".join(notification_parts)
                 self.send_notification("Calendar Sync", notification_message)
